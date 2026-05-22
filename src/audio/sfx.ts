@@ -16,6 +16,17 @@ function ensure(): AudioContext {
 
 export function unlockAudio() {
   const c = ensure();
+  // iOS Safari 対策: ユーザータップ中に 1サンプルの無音バッファを実際に再生して
+  // AudioContext を完全アンロックする（ctx.resume() だけでは足りない場合がある）
+  try {
+    const buf = c.createBuffer(1, 1, 22050);
+    const src = c.createBufferSource();
+    src.buffer = buf;
+    src.connect(c.destination);
+    src.start(0);
+  } catch {
+    // 古い実装で createBuffer が失敗してもアンロック試行は継続
+  }
   if (c.state === 'suspended') {
     c.resume().catch(() => {});
   }
