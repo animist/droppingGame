@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import { GAME, STORAGE_KEYS } from '../config/balance';
+import { playResultMelody } from '../audio/sfx';
 
 interface ResultData {
   score: number;
@@ -28,6 +29,7 @@ export class ResultScene extends Phaser.Scene {
     const isNewBest = data.score >= best && data.score > 0;
 
     this.cameras.main.fadeIn(300, 0, 0, 0);
+    playResultMelody();
 
     this.add.text(cx, cy - 240, 'GAME OVER', {
       fontSize: '88px',
@@ -122,7 +124,7 @@ export class ResultScene extends Phaser.Scene {
         this.restarting = true;
         this.cameras.main.fadeOut(200, 0, 0, 0);
         this.cameras.main.once('camerafadeoutcomplete', () => {
-          this.scene.start('Game');
+          this.scene.start('Title');
         });
       });
     });

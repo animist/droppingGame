@@ -4,6 +4,7 @@ import { BootScene } from './scenes/BootScene';
 import { TitleScene } from './scenes/TitleScene';
 import { GameScene } from './scenes/GameScene';
 import { ResultScene } from './scenes/ResultScene';
+import { SoundTestScene } from './scenes/SoundTestScene';
 
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
@@ -22,7 +23,7 @@ const config: Phaser.Types.Core.GameConfig = {
       debug: false,
     },
   },
-  scene: [BootScene, TitleScene, GameScene, ResultScene],
+  scene: [BootScene, TitleScene, GameScene, ResultScene, SoundTestScene],
 };
 
 new Phaser.Game(config);

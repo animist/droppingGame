@@ -36,8 +36,13 @@ export const GAME = {
   BALL_COLOR_RANGE_PX: 120,             // ボール直径が初期から+この値で終端色に到達
   BG_COLOR: '#1a1a2e',                 // ゲーム全体のキャンバス背景色（Phaser config用、文字列）
   BG_COLOR_START: 0x1a1a2e,            // ゲーム中の背景初期色（青紫）
-  BG_COLOR_END: 0x3a0a2a,              // ゲーム中の背景終端色（赤紫）
-  BG_COLOR_SCORE_RANGE: 40,            // スコアこの値で背景が終端色まで変化
+  BG_COLOR_END: 0x4a081f,              // ゲーム中の背景終端色（赤紫）
+  // 背景色は「隙間幅 / ボール直径」の比率で進行する（スコアではなく難易度ベース）。
+  // 比率が大きいほど START 色（余裕あり）、小さいほど END 色（ギリギリ）。
+  BG_GAP_RATIO_START: 2.0,             // 比率がこれ以上なら背景は完全に START 色（青紫）
+  BG_GAP_RATIO_25: 1.5,                // 比率がこれを下回ると 25% 混合
+  BG_GAP_RATIO_50: 1.25,               // 比率がこれを下回ると 50% 混合（中間色）
+  BG_GAP_RATIO_END: 1.1,               // 比率がこれ以下なら完全に END 色（赤紫）
 
   // --- 操作（スワイプ / 傾き） ---
   DRAG_X: 200,                         // 横方向の空気抵抗（px/s²の減速）。大きいほどボールが早く止まる
@@ -56,13 +61,13 @@ export const GAME = {
   SQUASH_SCALE_X: 1.3,                 // 接地時の横方向スクワッシュ倍率
   SQUASH_SCALE_Y: 0.7,                 // 接地時の縦方向スクワッシュ倍率（潰れ具合）
   SQUASH_DURATION_MS: 80,              // 潰れ→膨らみ への移行時間（ms）
-  EXPAND_SCALE: 1.3,                  // 膨らみフェーズの倍率（大きくなる印象を強調）
+  EXPAND_SCALE: 1.5,                  // 膨らみフェーズの倍率（大きくなる印象を強調）
   SETTLE_DURATION_MS: 130,             // 膨らみ→元サイズ に戻る時間（ms）
 
   // バウンス時に上方向へ飛び散るパーティクル
   BOUNCE_PARTICLE_COUNT: 12,            // 1回のバウンスで飛び散る粒の数
-  BOUNCE_PARTICLE_SPEED_MIN: 180,      // 粒の速度下限
-  BOUNCE_PARTICLE_SPEED_MAX: 380,      // 粒の速度上限
+  BOUNCE_PARTICLE_SPEED_MIN: 200,      // 粒の速度下限
+  BOUNCE_PARTICLE_SPEED_MAX: 400,      // 粒の速度上限
   BOUNCE_PARTICLE_DURATION_MS: 360,    // 粒が消えるまでの時間（ms）
 
   // --- 隙間通過演出 ---

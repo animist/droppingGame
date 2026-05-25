@@ -2,6 +2,7 @@ import { GAME } from '../config/balance';
 
 let ctx: AudioContext | null = null;
 let masterGain: GainNode | null = null;
+let autoResumeHookInstalled = false;
 
 function ensure(): AudioContext {
   if (!ctx) {
@@ -11,7 +12,29 @@ function ensure(): AudioContext {
     masterGain.gain.value = 0.5;
     masterGain.connect(ctx.destination);
   }
+  installAutoResumeHook();
   return ctx;
+}
+
+function tryResume() {
+  if (ctx && ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
+  }
+}
+
+// AudioContext は backgrounding / 画面ロック / 一定時間アイドル等で
+// suspended に戻ることがある。これを検知して resume を試みる。
+function installAutoResumeHook() {
+  if (autoResumeHookInstalled || typeof document === 'undefined') return;
+  autoResumeHookInstalled = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') tryResume();
+  });
+  // どのシーンでもユーザー操作が起きたら resume を試みる
+  const onInteract = () => tryResume();
+  document.addEventListener('pointerdown', onInteract, { capture: true, passive: true });
+  document.addEventListener('touchstart', onInteract, { capture: true, passive: true });
+  document.addEventListener('keydown', onInteract, { capture: true, passive: true });
 }
 
 export function unlockAudio() {
@@ -42,7 +65,12 @@ type ToneOpts = {
 };
 
 function tone(opts: ToneOpts) {
-  if (!ctx || ctx.state !== 'running' || !masterGain) return;
+  if (!ctx || !masterGain) return;
+  // suspended の場合は resume を試みる。今回の音は出ない可能性があるが、次回以降は復活する。
+  if (ctx.state !== 'running') {
+    tryResume();
+    return;
+  }
   const now = ctx.currentTime;
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
@@ -81,8 +109,53 @@ export function playPass() {
   setTimeout(() => tone({ freq: 1760, duration: 0.16, type: 'triangle', volume: 0.2 }), 110);
 }
 
+// ゲームオーバーの瞬間: C(下降グリス)を 100ms 間隔で 3 回重ねて鳴らす
 export function playGameOver() {
-  tone({ freq: 440, freqEnd: 110, duration: 0.6, type: 'sawtooth', volume: 0.22 });
+  playGameOverC();
+  setTimeout(() => playGameOverC(), 180);
+  setTimeout(() => playGameOverC(), 360);
+}
+
+// RESULT 画面のメロディ: A → 一拍休符 → B
+// A は約 560ms で終わるので、その後 400ms 休符を入れて B を 960ms 後に開始
+export function playResultMelody() {
+  setTimeout(() => playGameOverA(), 180);
+  setTimeout(() => playGameOverB(), 960);
+}
+
+// === GAME OVER 候補音（サウンドテスト用） ===
+
+// A: 8bit 死亡風（クロマチック下降、矩形波）
+export function playGameOverA() {
+  tone({ freq: 932, duration: 0.10, type: 'square', volume: 0.18 });
+  setTimeout(() => tone({ freq: 740, duration: 0.10, type: 'square', volume: 0.18 }), 120);
+  setTimeout(() => tone({ freq: 554, duration: 0.10, type: 'square', volume: 0.18 }), 240);
+  setTimeout(() => tone({ freq: 440, duration: 0.20, type: 'square', volume: 0.18 }), 360);
+}
+
+// B: 哀愁マイナーアルペジオ（C minor 下降、三角波）
+export function playGameOverB() {
+  tone({ freq: 523, duration: 0.18, type: 'triangle', volume: 0.20 });
+  setTimeout(() => tone({ freq: 415, duration: 0.18, type: 'triangle', volume: 0.20 }), 180);
+  setTimeout(() => tone({ freq: 311, duration: 0.18, type: 'triangle', volume: 0.20 }), 360);
+  setTimeout(() => tone({ freq: 262, duration: 0.50, type: 'triangle', volume: 0.20 }), 540);
+}
+
+// C: ワーン...諦め下降グリッサンド（1音、長く下げる）
+export function playGameOverC() {
+  tone({ freq: 880, freqEnd: 110, duration: 1.20, type: 'sawtooth', volume: 0.22 });
+}
+
+// D: 重低音の鐘（オクターブ重ね、長い減衰）
+export function playGameOverD() {
+  tone({ freq: 110, duration: 1.50, type: 'sine', volume: 0.28, attack: 0.005 });
+  tone({ freq: 220, duration: 1.50, type: 'triangle', volume: 0.14, attack: 0.005 });
+}
+
+// E: 不協和2音重ね（半音差、ピアノ的ザワッ感）
+export function playGameOverE() {
+  tone({ freq: 349, duration: 0.70, type: 'triangle', volume: 0.18 });
+  tone({ freq: 370, duration: 0.70, type: 'triangle', volume: 0.18 });
 }
 
 export function playPerfectPass(streakCents = 0) {
@@ -118,7 +191,11 @@ function ensureFallSound() {
 }
 
 export function updateFallSound(velocityY: number, maxVelocity: number, maxGain: number, streakCents = 0) {
-  if (!ctx || ctx.state !== 'running') return;
+  if (!ctx) return;
+  if (ctx.state !== 'running') {
+    tryResume();
+    return;
+  }
   ensureFallSound();
   if (!fallOsc || !fallFilter || !fallGain) return;
   // 上下どちらの方向でも |velocityY| をベースに音を出す:

@@ -139,6 +139,7 @@ export class GameScene extends Phaser.Scene {
     this.squashBall();
     this.emitBounceBurst(this.ball.x, this.ball.y + this.ballDiameter / 2);
     this.updateBallColor();
+    this.updateBgColor();
     this.checkWarning();
     playBounce(this.ballDiameter);
 
@@ -283,7 +284,6 @@ export class GameScene extends Phaser.Scene {
       playPass();
       vibrate([0, 25, 40, 25]);
     }
-    this.updateBgColor();
 
     const body = this.ball.body as Phaser.Physics.Arcade.Body;
     body.enable = false;
@@ -312,6 +312,7 @@ export class GameScene extends Phaser.Scene {
           this.ballDiameter + GAME.GAP_MIN_MARGIN,
           this.gapWidth - GAME.GAP_REDUCTION,
         );
+        this.updateBgColor();
 
         if (this.ballDiameter > this.gapWidth) {
           body.enable = true;
@@ -429,7 +430,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateBgColor() {
-    const targetT = Math.min(1, this.score / GAME.BG_COLOR_SCORE_RANGE);
+    const ratio = this.gapWidth / this.ballDiameter;
+    const targetT = this.bgProgressFromRatio(ratio);
     const proxy = { t: this.bgProgress };
     this.tweens.add({
       targets: proxy,
@@ -442,6 +444,20 @@ export class GameScene extends Phaser.Scene {
         this.cameras.main.setBackgroundColor(c);
       },
     });
+  }
+
+  // 隙間幅/ボール直径 の比率 → 補間係数 t (0=START 色, 1=END 色)
+  // 区分線形補間で 4つの breakpoint をつなぐ
+  private bgProgressFromRatio(ratio: number): number {
+    const r0 = GAME.BG_GAP_RATIO_START;
+    const r1 = GAME.BG_GAP_RATIO_25;
+    const r2 = GAME.BG_GAP_RATIO_50;
+    const r3 = GAME.BG_GAP_RATIO_END;
+    if (ratio >= r0) return 0;
+    if (ratio >= r1) return ((r0 - ratio) / (r0 - r1)) * 0.25;
+    if (ratio >= r2) return 0.25 + ((r1 - ratio) / (r1 - r2)) * 0.25;
+    if (ratio >= r3) return 0.5 + ((r2 - ratio) / (r2 - r3)) * 0.5;
+    return 1;
   }
 
   private spawnScorePopup(x: number, y: number, points: number, special: boolean) {

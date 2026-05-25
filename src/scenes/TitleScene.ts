@@ -14,16 +14,15 @@ export class TitleScene extends Phaser.Scene {
 
     this.createDemoBall();
 
+    // 全画面タップゾーン（SOUND TEST ボタン以外の領域がここで受け付けられる）
+    const bgZone = this.add.rectangle(cx, cy, GAME.WIDTH, GAME.HEIGHT)
+      .setInteractive()
+      .setDepth(-2);
+
     this.add.text(cx, cy - 240, 'DROPPING', {
       fontSize: '110px',
-      color: '#ffffff',
-      fontStyle: 'bold',
-    }).setOrigin(0.5);
-
-    this.add.text(cx, cy - 140, '球を隙間に通し続けろ', {
-      fontSize: '36px',
       color: '#aaaaff',
-      padding: { top: 6, bottom: 4 },
+      fontStyle: 'bold',
     }).setOrigin(0.5);
 
     const highScore = Number(localStorage.getItem(STORAGE_KEYS.HIGH_SCORE) ?? 0);
@@ -52,7 +51,7 @@ export class TitleScene extends Phaser.Scene {
       repeat: -1,
     });
 
-    this.input.once('pointerdown', () => {
+    bgZone.on('pointerdown', () => {
       unlockAudio();
       enableTilt().finally(() => {
         this.scene.start('Game');
