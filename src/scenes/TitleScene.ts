@@ -31,11 +31,13 @@ export class TitleScene extends Phaser.Scene {
       color: '#ffeb70',
     }).setOrigin(0.5);
 
+    /*
     this.add.text(cx, cy + 100, '端末を傾ける / 横スワイプで操作', {
       fontSize: '30px',
       color: '#cccccc',
       padding: { top: 6, bottom: 4 },
     }).setOrigin(0.5);
+    */
 
     const tapBtn = this.add.text(cx, cy + 240, 'TAP TO START', {
       fontSize: '56px',
