@@ -260,7 +260,14 @@ export class GameScene extends Phaser.Scene {
     this.isScrolling = true;
 
     const isPerfect = this.bounceCount === 0;
-    const points = isPerfect ? 1 + GAME.NO_BOUNCE_BONUS : 1;
+    // ボール色の進行度 t (0=初期色、1=完全に終端色) が閾値以上で終端色ボーナス発動
+    const colorT = (this.ballDiameter - GAME.BALL_INITIAL_DIAMETER) / GAME.BALL_COLOR_RANGE_PX;
+    const isAtEndColor = colorT >= GAME.END_COLOR_BONUS_THRESHOLD;
+    let points = isPerfect ? 1 + GAME.NO_BOUNCE_BONUS : 1;
+    if (isAtEndColor) {
+      // 終端色での通過は別途加算。PERFECT 時は更に倍。
+      points += isPerfect ? GAME.END_COLOR_BONUS * 2 : GAME.END_COLOR_BONUS;
+    }
     this.score += points;
     this.scoreText.setText(this.score.toString());
 
@@ -275,7 +282,7 @@ export class GameScene extends Phaser.Scene {
       ? GAME.PARTICLE_COUNT + GAME.PERFECT_PARTICLE_COUNT
       : GAME.PARTICLE_COUNT;
     this.emitBurst(this.ball.x, GAME.LINE_Y, particleCount);
-    this.spawnScorePopup(this.ball.x, GAME.LINE_Y, points, isPerfect);
+    this.spawnScorePopup(this.ball.x, GAME.LINE_Y, points, isPerfect, isAtEndColor);
     if (isPerfect) {
       this.spawnPerfectText(this.perfectStreak);
       playPerfectPass(this.perfectStreak * GAME.FALL_STREAK_PITCH_CENTS);
@@ -460,10 +467,26 @@ export class GameScene extends Phaser.Scene {
     return 1;
   }
 
-  private spawnScorePopup(x: number, y: number, points: number, special: boolean) {
+  private spawnScorePopup(x: number, y: number, points: number, special: boolean, isAtEndColor = false) {
+    // 終端色ボーナスは色とサイズで一段格上にする
+    let fontSize: string;
+    let color: string;
+    if (isAtEndColor && special) {
+      fontSize = '108px';
+      color = '#ff70a0'; // ピンク寄りの赤紫: 究極ボーナス
+    } else if (isAtEndColor) {
+      fontSize = '88px';
+      color = '#ff5040'; // 終端色っぽい赤
+    } else if (special) {
+      fontSize = '88px';
+      color = '#ffd700'; // PERFECT 金
+    } else {
+      fontSize = '64px';
+      color = '#ffeb70'; // 通常 黄
+    }
     const text = this.add.text(x, y, `+${points}`, {
-      fontSize: special ? '88px' : '64px',
-      color: special ? '#ffd700' : '#ffeb70',
+      fontSize,
+      color,
       fontStyle: 'bold',
     }).setOrigin(0.5).setDepth(950);
     this.tweens.add({
