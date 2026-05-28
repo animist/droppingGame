@@ -25,6 +25,8 @@ export class GameScene extends Phaser.Scene {
   private warningTween: Phaser.Tweens.Tween | null = null;
   private bounceCount = 0;
   private perfectStreak = 0;
+  private gammaRest = 0;        // 持ち方の傾き癖を吸収するための中立値
+  private gammaCalibrated = false;
 
   constructor() {
     super('Game');
@@ -44,6 +46,13 @@ export class GameScene extends Phaser.Scene {
     this.warningActive = false;
     this.bounceCount = 0;
     this.perfectStreak = 0;
+    this.gammaRest = 0;
+    this.gammaCalibrated = false;
+    // 200ms 後に傾きセンサーの現在値を「中立」として記録（端末を構える角度の癖を吸収）
+    this.time.delayedCall(200, () => {
+      if (tilt.enabled) this.gammaRest = tilt.value;
+      this.gammaCalibrated = true;
+    });
     this.cameras.main.setBackgroundColor(GAME.BG_COLOR_START);
 
     this.scoreText = this.add.text(GAME.WIDTH / 2, 100, '0', {
@@ -227,8 +236,11 @@ export class GameScene extends Phaser.Scene {
       this.pointerLastX = null;
     }
 
-    if (tilt.enabled && Math.abs(tilt.value) > GAME.TILT_DEAD_ZONE_DEG) {
-      body.velocity.x += tilt.value * GAME.TILT_FACTOR * (delta / 1000);
+    if (tilt.enabled && this.gammaCalibrated) {
+      const tiltX = tilt.value - this.gammaRest;
+      if (Math.abs(tiltX) > GAME.TILT_DEAD_ZONE_DEG) {
+        body.velocity.x += tiltX * GAME.TILT_FACTOR * (delta / 1000);
+      }
     }
 
     this.trailTimer += delta;
@@ -263,17 +275,24 @@ export class GameScene extends Phaser.Scene {
     // ボール色の進行度 t (0=初期色、1=完全に終端色) が閾値以上で終端色ボーナス発動
     const colorT = (this.ballDiameter - GAME.BALL_INITIAL_DIAMETER) / GAME.BALL_COLOR_RANGE_PX;
     const isAtEndColor = colorT >= GAME.END_COLOR_BONUS_THRESHOLD;
+
+    // 連続パーフェクトの計数を先に更新（コンボボーナスの算出で使う）
+    if (isPerfect) {
+      this.perfectStreak += 1;
+    }
+
     let points = isPerfect ? 1 + GAME.NO_BOUNCE_BONUS : 1;
+    // コンボボーナス: PERFECT が 2 回以上連続した時、コンボ回数を加算
+    // (例: streak=2 → +2、streak=3 → +3 ...)
+    if (isPerfect && this.perfectStreak >= 2) {
+      points += this.perfectStreak;
+    }
     if (isAtEndColor) {
       // 終端色での通過は別途加算。PERFECT 時は更に倍。
       points += isPerfect ? GAME.END_COLOR_BONUS * 2 : GAME.END_COLOR_BONUS;
     }
     this.score += points;
     this.scoreText.setText(this.score.toString());
-
-    if (isPerfect) {
-      this.perfectStreak += 1;
-    }
 
     this.stopWarning();
     this.popScore();
