@@ -2,6 +2,7 @@ import { GAME } from '../config/balance';
 
 let ctx: AudioContext | null = null;
 let masterGain: GainNode | null = null;
+let musicGain: GainNode | null = null;
 let autoResumeHookInstalled = false;
 
 function ensure(): AudioContext {
@@ -14,6 +15,21 @@ function ensure(): AudioContext {
   }
   installAutoResumeHook();
   return ctx;
+}
+
+// BGM 用の独立した音量バス（SFX とは別系統で音量調整可能）
+export function getMusicBus(): { ctx: AudioContext; bus: GainNode } | null {
+  const c = ensure();
+  if (!musicGain) {
+    musicGain = c.createGain();
+    musicGain.gain.value = 0;
+    musicGain.connect(c.destination);
+  }
+  return { ctx: c, bus: musicGain };
+}
+
+export function audioIsRunning(): boolean {
+  return !!ctx && ctx.state === 'running';
 }
 
 function tryResume() {
@@ -62,6 +78,10 @@ type ToneOpts = {
   volume?: number;
   attack?: number;
   freqEnd?: number;
+  detune?: number;       // 固定 detune（cents）
+  detuneJitter?: number; // ±この範囲(cents)でランダムに揺らす
+  volumeJitter?: number; // ±この割合で音量をランダムに揺らす（0.4=±40%）
+  pan?: number;          // -1(左) 〜 +1(右) のステレオ定位
 };
 
 function tone(opts: ToneOpts) {
@@ -75,10 +95,14 @@ function tone(opts: ToneOpts) {
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   const attack = opts.attack ?? 0.005;
-  const volume = opts.volume ?? 0.2;
+  const baseVolume = opts.volume ?? 0.2;
+  const volJitter = opts.volumeJitter ? 1 + (Math.random() * 2 - 1) * opts.volumeJitter : 1;
+  const volume = baseVolume * volJitter;
 
   osc.type = opts.type ?? 'sine';
   osc.frequency.setValueAtTime(opts.freq, now);
+  const jitter = opts.detuneJitter ? (Math.random() * 2 - 1) * opts.detuneJitter : 0;
+  osc.detune.setValueAtTime((opts.detune ?? 0) + jitter, now);
   if (opts.freqEnd !== undefined) {
     osc.frequency.exponentialRampToValueAtTime(Math.max(1, opts.freqEnd), now + opts.duration);
   }
@@ -88,25 +112,57 @@ function tone(opts: ToneOpts) {
   gain.gain.exponentialRampToValueAtTime(0.001, now + opts.duration);
 
   osc.connect(gain);
-  gain.connect(masterGain);
+  // ステレオパンが指定されていれば PannerNode を挟む
+  if (opts.pan !== undefined && typeof ctx.createStereoPanner === 'function') {
+    const panner = ctx.createStereoPanner();
+    panner.pan.setValueAtTime(Math.max(-1, Math.min(1, opts.pan)), now);
+    gain.connect(panner);
+    panner.connect(masterGain);
+  } else {
+    gain.connect(masterGain);
+  }
   osc.start(now);
   osc.stop(now + opts.duration + 0.05);
 }
 
-export function playBounce(ballDiameter: number) {
+export function playBounce(ballDiameter: number, pan = 0) {
   const t = clamp((ballDiameter - 30) / 100, 0, 1);
   const freq = 720 - (720 - 220) * t;
-  tone({ freq, freqEnd: freq * 0.6, duration: 0.09, type: 'triangle', volume: 0.18 });
+  // 長さも僅かにランダム化して1回ごとの個性を増やす
+  const duration = 0.09 * (0.8 + Math.random() * 0.4);
+  tone({
+    freq, freqEnd: freq * 0.6, duration, type: 'triangle', volume: 0.18,
+    detuneJitter: GAME.BOUNCE_DETUNE_JITTER, volumeJitter: GAME.BOUNCE_VOLUME_JITTER, pan,
+  });
 }
 
-export function playWall() {
-  tone({ freq: 380, freqEnd: 280, duration: 0.06, type: 'square', volume: 0.1 });
+export function playWall(pan = 0) {
+  tone({
+    freq: 380, freqEnd: 280, duration: 0.06, type: 'square', volume: 0.1,
+    detuneJitter: GAME.WALL_DETUNE_JITTER, volumeJitter: GAME.BOUNCE_VOLUME_JITTER, pan,
+  });
 }
 
-export function playPass() {
-  tone({ freq: 880, duration: 0.08, type: 'triangle', volume: 0.2 });
-  setTimeout(() => tone({ freq: 1320, duration: 0.08, type: 'triangle', volume: 0.2 }), 55);
-  setTimeout(() => tone({ freq: 1760, duration: 0.16, type: 'triangle', volume: 0.2 }), 110);
+export function playPass(pan = 0) {
+  tone({ freq: 880, duration: 0.08, type: 'triangle', volume: 0.2, pan });
+  setTimeout(() => tone({ freq: 1320, duration: 0.08, type: 'triangle', volume: 0.2, pan }), 55);
+  setTimeout(() => tone({ freq: 1760, duration: 0.16, type: 'triangle', volume: 0.2, pan }), 110);
+}
+
+// ニアミス: 鋭い上向きの「ヒュッ」という緊張感のある音
+export function playNearMiss(pan = 0) {
+  tone({ freq: 600, freqEnd: 1500, duration: 0.16, type: 'sawtooth', volume: 0.16, pan });
+  setTimeout(() => tone({ freq: 1800, duration: 0.10, type: 'sine', volume: 0.14, pan }), 90);
+}
+
+// マイルストーン: 明るく開けた上昇ファンファーレ（メジャーアルペジオ）
+export function playMilestone() {
+  const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
+  notes.forEach((f, i) => {
+    setTimeout(() => tone({ freq: f, duration: 0.22, type: 'triangle', volume: 0.22 }), i * 90);
+  });
+  // 最後に重ねて広がり
+  setTimeout(() => tone({ freq: 1318.5, duration: 0.5, type: 'triangle', volume: 0.16 }), 360);
 }
 
 // ゲームオーバーの瞬間: C(下降グリス)を 100ms 間隔で 3 回重ねて鳴らす
@@ -158,12 +214,12 @@ export function playGameOverE() {
   tone({ freq: 370, duration: 0.70, type: 'triangle', volume: 0.18 });
 }
 
-export function playPerfectPass(streakCents = 0) {
+export function playPerfectPass(streakCents = 0, pan = 0) {
   const mult = Math.pow(2, streakCents / 1200);
-  tone({ freq: 1175 * mult, duration: 0.1, type: 'triangle', volume: 0.22 });
-  setTimeout(() => tone({ freq: 1568 * mult, duration: 0.1, type: 'triangle', volume: 0.22 }), 50);
-  setTimeout(() => tone({ freq: 1976 * mult, duration: 0.1, type: 'triangle', volume: 0.22 }), 100);
-  setTimeout(() => tone({ freq: 2349 * mult, duration: 0.22, type: 'triangle', volume: 0.22 }), 150);
+  tone({ freq: 1175 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan });
+  setTimeout(() => tone({ freq: 1568 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan }), 50);
+  setTimeout(() => tone({ freq: 1976 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan }), 100);
+  setTimeout(() => tone({ freq: 2349 * mult, duration: 0.22, type: 'triangle', volume: 0.22, pan }), 150);
 }
 
 let fallOsc: OscillatorNode | null = null;

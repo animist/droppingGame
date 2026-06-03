@@ -1,9 +1,10 @@
 import Phaser from 'phaser';
 import { GAME, STORAGE_KEYS } from '../config/balance';
 import { tilt } from '../input/tilt';
-import { playBounce, playWall, playPass, playGameOver, playPerfectPass, updateFallSound, muteFallSound } from '../audio/sfx';
+import { playBounce, playWall, playPass, playGameOver, playPerfectPass, playNearMiss, playMilestone, updateFallSound, muteFallSound } from '../audio/sfx';
+import { startMusic, stopMusic, setMusicIntensity, intensityFromScore } from '../audio/music';
 import { vibrate } from '../input/haptics';
-import { lerpColor } from '../util/color';
+import { lerpColor, brighten } from '../util/color';
 
 export class GameScene extends Phaser.Scene {
   private ball!: Phaser.GameObjects.Arc;
@@ -27,6 +28,22 @@ export class GameScene extends Phaser.Scene {
   private perfectStreak = 0;
   private gammaRest = 0;        // 持ち方の傾き癖を吸収するための中立値
   private gammaCalibrated = false;
+  private ballGlow: Phaser.FX.Glow | null = null;
+  private ballGlowBase = GAME.GLOW_BALL_BASE;  // 色の進行度で決まるグロー基準強度（揺らぎ前）
+  private lineGlows: Phaser.FX.Glow[] = [];
+  private parallaxDots: { obj: Phaser.GameObjects.Arc; speed: number; ratio: number }[] = [];
+  private musicIntensity = 0;
+  private scrollProxy = { y: 0 };       // ライン上昇に同期する仮想スクロール位置
+  private scrollPrevY = 0;
+  private parallaxScrolling = false;
+  private nextMilestoneIdx = 0;         // 次に到達すべきマイルストーンのインデックス
+  private frozen = false;               // ニアミスのストップモーション中フラグ
+  // ニアミスのピボット固定ズーム状態
+  private nmActive = false;
+  private nmElapsed = 0;
+  private nmPivotX = 0;
+  private nmPivotY = 0;
+  private nmText: Phaser.GameObjects.Text | null = null;
 
   constructor() {
     super('Game');
@@ -48,12 +65,26 @@ export class GameScene extends Phaser.Scene {
     this.perfectStreak = 0;
     this.gammaRest = 0;
     this.gammaCalibrated = false;
+    this.ballGlow = null;
+    this.lineGlows = [];
+    this.parallaxScrolling = false;
+    this.nextMilestoneIdx = 0;
+    this.frozen = false;
+    this.nmActive = false;
+    this.nmText = null;
+    this.cameras.main.setZoom(1);
+    this.cameras.main.setScroll(0, 0);
+    this.time.timeScale = 1;
+    this.tweens.timeScale = 1;
+    if (this.physics.world) this.physics.world.timeScale = 1;
     // 200ms 後に傾きセンサーの現在値を「中立」として記録（端末を構える角度の癖を吸収）
     this.time.delayedCall(200, () => {
       if (tilt.enabled) this.gammaRest = tilt.value;
       this.gammaCalibrated = true;
     });
     this.cameras.main.setBackgroundColor(GAME.BG_COLOR_START);
+
+    this.createParallax();
 
     this.scoreText = this.add.text(GAME.WIDTH / 2, 100, '0', {
       fontSize: '120px',
@@ -65,6 +96,13 @@ export class GameScene extends Phaser.Scene {
     this.createBall();
     this.randomizeGapCenter();
     this.createLines();
+    this.updateBallColor(); // 初期の穴比率に応じた色を反映
+
+    // BGM 開始
+    this.musicIntensity = 0;
+    setMusicIntensity(0);
+    startMusic();
+    this.events.once('shutdown', () => stopMusic());
     this.setupInput();
   }
 
@@ -80,6 +118,62 @@ export class GameScene extends Phaser.Scene {
     body.setMaxVelocity(GAME.MAX_VELOCITY, GAME.MAX_VELOCITY);
     body.onWorldBounds = true;
     this.physics.world.on('worldbounds', this.onWallBounce, this);
+    this.ballGlow = this.addGlow(this.ball, GAME.GLOW_BALL_BASE, brighten(GAME.BALL_COLOR_START, GAME.GLOW_BALL_BRIGHTEN));
+  }
+
+  // 背景の3層パララックス（奥行き感のあるドット群）
+  // ratio: ライン上昇スクロールに連動する際の追従率（近景=1.0でライン速度に一致、遠景ほど小さく＝視差）
+  private createParallax() {
+    this.parallaxDots = [];
+    const layers = [
+      { count: GAME.PARALLAX_FAR_COUNT, size: 2, alpha: 0.12, speed: 14, color: 0x8888aa, ratio: 0.25 },
+      { count: GAME.PARALLAX_MID_COUNT, size: 3, alpha: 0.20, speed: 32, color: 0xaaaacc, ratio: 0.55 },
+      { count: GAME.PARALLAX_NEAR_COUNT, size: 5, alpha: 0.28, speed: 60, color: 0xccccee, ratio: 1.0 },
+    ];
+    for (const L of layers) {
+      for (let i = 0; i < L.count; i++) {
+        const dot = this.add.circle(
+          Phaser.Math.Between(0, GAME.WIDTH),
+          Phaser.Math.Between(0, GAME.HEIGHT),
+          L.size, L.color, L.alpha,
+        ).setDepth(-10);
+        this.parallaxDots.push({ obj: dot, speed: L.speed, ratio: L.ratio });
+      }
+    }
+  }
+
+  private updateParallax(delta: number) {
+    const dt = delta / 1000;
+    // ライン上昇に同期した追加スクロール量（px、上方向）
+    let scrollDelta = 0;
+    if (this.parallaxScrolling) {
+      scrollDelta = this.scrollPrevY - this.scrollProxy.y;
+      this.scrollPrevY = this.scrollProxy.y;
+    }
+    for (const p of this.parallaxDots) {
+      // 常時のゆるやかな上方向ドリフト + ライン同期スクロール（層ごとの視差を保つ）
+      p.obj.y -= p.speed * GAME.PARALLAX_DRIFT_SPEED * dt;
+      if (scrollDelta !== 0) p.obj.y -= scrollDelta * p.ratio;
+      // 画面外に出たら反対側へ循環
+      if (p.obj.y < -8) {
+        p.obj.y += GAME.HEIGHT + 16;
+        p.obj.x = Phaser.Math.Between(0, GAME.WIDTH);
+      } else if (p.obj.y > GAME.HEIGHT + 8) {
+        p.obj.y -= GAME.HEIGHT + 16;
+        p.obj.x = Phaser.Math.Between(0, GAME.WIDTH);
+      }
+    }
+  }
+
+  // WebGL の Glow FX を安全に追加（Canvasレンダラーでは無視）。失敗してもゲームは続行。
+  private addGlow(obj: Phaser.GameObjects.Shape, strength: number, color?: number): Phaser.FX.Glow | null {
+    try {
+      const fx = obj.postFX;
+      if (!fx) return null;
+      return fx.addGlow(color, strength, 0, false, 0.1, 16);
+    } catch {
+      return null;
+    }
   }
 
   private createLines() {
@@ -101,6 +195,13 @@ export class GameScene extends Phaser.Scene {
 
     this.physics.add.existing(this.leftLine, true);
     this.physics.add.existing(this.rightLine, true);
+
+    // 新ラインのグロー参照を保持（呼吸アニメ用、古い参照は破棄）
+    this.lineGlows = [];
+    const gl = this.addGlow(this.leftLine, GAME.GLOW_LINE);
+    const gr = this.addGlow(this.rightLine, GAME.GLOW_LINE);
+    if (gl) this.lineGlows.push(gl);
+    if (gr) this.lineGlows.push(gr);
 
     this.physics.add.collider(this.ball, this.leftLine, () => this.onBounce());
     this.physics.add.collider(this.ball, this.rightLine, () => this.onBounce());
@@ -150,7 +251,7 @@ export class GameScene extends Phaser.Scene {
     this.updateBallColor();
     this.updateBgColor();
     this.checkWarning();
-    playBounce(this.ballDiameter);
+    playBounce(this.ballDiameter, this.ballPan());
 
     const sizeRatio = this.ballDiameter / GAME.BALL_INITIAL_DIAMETER;
     this.cameras.main.shake(
@@ -168,8 +269,30 @@ export class GameScene extends Phaser.Scene {
     if (this.isGameOver || this.isScrolling) return;
     if (body.gameObject !== this.ball) return;
     if (body.blocked.left || body.blocked.right) {
-      playWall();
+      playWall(this.ballPan());
     }
+  }
+
+  // ボールのx位置 → ステレオパン (-1〜+1)
+  private ballPan(): number {
+    const t = (this.ball.x / GAME.WIDTH) * 2 - 1; // -1..+1
+    return Math.max(-1, Math.min(1, t)) * GAME.AUDIO_PAN_STRENGTH;
+  }
+
+  // 成功の瞬間に一瞬スローモーション（time scale を下げて実時間で戻す）
+  private triggerTimeDilation() {
+    const scale = GAME.TIME_DILATION_SCALE;
+    this.time.timeScale = scale;
+    this.tweens.timeScale = scale;
+    if (this.physics.world) this.physics.world.timeScale = 1 / scale; // arcadeは逆数で遅くなる
+
+    // 復帰は実時間で行う（スロー自体に引きずられないよう window.setTimeout を使用）
+    window.setTimeout(() => {
+      if (!this.scene.isActive()) return;
+      this.time.timeScale = 1;
+      this.tweens.timeScale = 1;
+      if (this.physics.world) this.physics.world.timeScale = 1;
+    }, GAME.TIME_DILATION_HOLD_MS + GAME.TIME_DILATION_RECOVER_MS);
   }
 
   private squashBall() {
@@ -208,6 +331,15 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(_time: number, delta: number) {
+    // ニアミスのピボット固定ズームは凍結中も毎フレーム駆動する（カメラだけ動かす）
+    if (this.nmActive) this.updateNearMissZoom(delta);
+
+    // ニアミスのストップモーション中は世界の演出を停止（カメラ以外は止まって見える）
+    if (this.frozen) {
+      muteFallSound();
+      return;
+    }
+
     const body = this.ball.body as Phaser.Physics.Arcade.Body | null;
     if (body && body.enable && !this.isGameOver) {
       updateFallSound(
@@ -218,6 +350,22 @@ export class GameScene extends Phaser.Scene {
       );
     } else {
       muteFallSound();
+    }
+
+    // パララックスは演出なので常に更新（スクロール中・ゲームオーバー後も動かす）
+    this.updateParallax(delta);
+
+    // グロー強度を sin で揺らがせて「呼吸する発光」にする
+    if (this.ballGlow) {
+      const pulse = Math.sin(_time * 0.001 * GAME.GLOW_PULSE_FREQ) * GAME.GLOW_PULSE_AMP;
+      this.ballGlow.outerStrength = Math.max(0, this.ballGlowBase + pulse);
+    }
+    // ラインはより遅く・小さく呼吸（基準より控えめでゼロにはならない）
+    if (this.lineGlows.length) {
+      const linePulse = Math.sin(_time * 0.001 * GAME.GLOW_LINE_PULSE_FREQ) * GAME.GLOW_LINE_PULSE_AMP;
+      for (const g of this.lineGlows) {
+        g.outerStrength = GAME.GLOW_LINE + linePulse;
+      }
     }
 
     if (this.isGameOver || this.isScrolling || !body) return;
@@ -257,7 +405,15 @@ export class GameScene extends Phaser.Scene {
       const leftInnerX = this.leftLine.x + this.leftLine.width / 2;
       const rightInnerX = this.rightLine.x - this.rightLine.width / 2;
       if (this.ball.x > leftInnerX && this.ball.x < rightInnerX) {
-        this.onPassThroughGap();
+        // ボール端から左右ライン端までの余白（ニアミス判定用）
+        const radius = this.ballDiameter / 2;
+        const leftMargin = (this.ball.x - leftInnerX) - radius;
+        const rightMargin = (rightInnerX - this.ball.x) - radius;
+        const clearance = Math.min(leftMargin, rightMargin);
+        // ギリギリだった側のライン端をフォーカス点に
+        const focusEdgeX = leftMargin < rightMargin ? leftInnerX : rightInnerX;
+        const focusX = (this.ball.x + focusEdgeX) / 2;
+        this.onPassThroughGap(clearance, focusX);
         return;
       }
     }
@@ -267,14 +423,14 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private onPassThroughGap() {
+  private onPassThroughGap(clearance = Infinity, focusX = GAME.WIDTH / 2) {
     this.hasPassedGap = true;
     this.isScrolling = true;
 
+    const isNearMiss = clearance <= GAME.NEAR_MISS_CLEARANCE_PX;
     const isPerfect = this.bounceCount === 0;
     // ボール色の進行度 t (0=初期色、1=完全に終端色) が閾値以上で終端色ボーナス発動
-    const colorT = (this.ballDiameter - GAME.BALL_INITIAL_DIAMETER) / GAME.BALL_COLOR_RANGE_PX;
-    const isAtEndColor = colorT >= GAME.END_COLOR_BONUS_THRESHOLD;
+    const isAtEndColor = this.ballColorT() >= GAME.END_COLOR_BONUS_THRESHOLD;
 
     // 連続パーフェクトの計数を先に更新（コンボボーナスの算出で使う）
     if (isPerfect) {
@@ -291,8 +447,23 @@ export class GameScene extends Phaser.Scene {
       // 終端色での通過は別途加算。PERFECT 時は更に倍。
       points += isPerfect ? GAME.END_COLOR_BONUS * 2 : GAME.END_COLOR_BONUS;
     }
+    if (isNearMiss) {
+      // ギリギリ通過（CLOSE）のボーナス
+      points += GAME.NEAR_MISS_BONUS;
+    }
+    const prevScore = this.score;
     this.score += points;
     this.scoreText.setText(this.score.toString());
+
+    // BGM の盛り上がりをスコアに連動
+    const newIntensity = intensityFromScore(this.score);
+    if (newIntensity !== this.musicIntensity) {
+      this.musicIntensity = newIntensity;
+      setMusicIntensity(newIntensity);
+    }
+
+    // マイルストーン到達チェック（1回の通過で複数跨いだ場合は最高位を採用）
+    this.checkMilestones(prevScore, this.score);
 
     this.stopWarning();
     this.popScore();
@@ -302,12 +473,15 @@ export class GameScene extends Phaser.Scene {
       : GAME.PARTICLE_COUNT;
     this.emitBurst(this.ball.x, GAME.LINE_Y, particleCount);
     this.spawnScorePopup(this.ball.x, GAME.LINE_Y, points, isPerfect, isAtEndColor);
+    // ニアミス時は専用のストップモーション演出を使うので通常のスローは省く
+    if (!isNearMiss) this.triggerTimeDilation();
+    const pan = this.ballPan();
     if (isPerfect) {
       this.spawnPerfectText(this.perfectStreak);
-      playPerfectPass(this.perfectStreak * GAME.FALL_STREAK_PITCH_CENTS);
+      playPerfectPass(this.perfectStreak * GAME.FALL_STREAK_PITCH_CENTS, pan);
       vibrate([0, 40, 30, 40, 30, 60]);
     } else {
-      playPass();
+      playPass(pan);
       vibrate([0, 25, 40, 25]);
     }
 
@@ -328,6 +502,21 @@ export class GameScene extends Phaser.Scene {
       },
     });
 
+    // 背景パララックスをラインと同じ動き（時間・イージング）でスクロールアウトさせる。
+    // tweens.timeScale 経由でタイムダイレーションのスローにも自動同期する。
+    this.scrollProxy.y = GAME.LINE_Y;
+    this.scrollPrevY = GAME.LINE_Y;
+    this.parallaxScrolling = true;
+    this.tweens.add({
+      targets: this.scrollProxy,
+      y: -GAME.LINE_HEIGHT,
+      duration: GAME.SCROLL_DURATION,
+      ease: 'Cubic.easeIn',
+      onComplete: () => {
+        this.parallaxScrolling = false;
+      },
+    });
+
     this.tweens.add({
       targets: this.ball,
       y: GAME.BALL_START_Y,
@@ -339,6 +528,7 @@ export class GameScene extends Phaser.Scene {
           this.gapWidth - GAME.GAP_REDUCTION,
         );
         this.updateBgColor();
+        this.updateBallColor(); // 穴が縮んで比率が変わったのでボール色も更新
 
         if (this.ballDiameter > this.gapWidth) {
           body.enable = true;
@@ -367,6 +557,11 @@ export class GameScene extends Phaser.Scene {
         });
       },
     });
+
+    // ニアミス時はここで全体をストップモーション + 強ズーム（スクロールtween生成後に凍結）
+    if (isNearMiss) {
+      this.triggerNearMiss(focusX, GAME.LINE_Y, pan);
+    }
   }
 
   private popScore() {
@@ -449,10 +644,23 @@ export class GameScene extends Phaser.Scene {
     this.rightLine?.setFillStyle(GAME.LINE_COLOR);
   }
 
+  // ボール色の進行度 t (0=開始色、1=終端色)。「ボール直径 / 穴幅」の比率で決まる
+  private ballColorT(): number {
+    const ratio = this.ballDiameter / this.gapWidth;
+    const t = (ratio - GAME.BALL_COLOR_RATIO_START) / (GAME.BALL_COLOR_RATIO_END - GAME.BALL_COLOR_RATIO_START);
+    return Math.max(0, Math.min(1, t));
+  }
+
   private updateBallColor() {
-    const t = (this.ballDiameter - GAME.BALL_INITIAL_DIAMETER) / GAME.BALL_COLOR_RANGE_PX;
+    const t = this.ballColorT();
     const c = lerpColor(GAME.BALL_COLOR_START, GAME.BALL_COLOR_END, t);
     this.ball.setFillStyle(c);
+    // 終端色に近づくほどグロー基準を強くし、色はボール色を明るくした同系色にする
+    // （実際の強度は update() で sin 揺らぎを乗せる）
+    this.ballGlowBase = GAME.GLOW_BALL_BASE + (GAME.GLOW_BALL_MAX - GAME.GLOW_BALL_BASE) * t;
+    if (this.ballGlow) {
+      this.ballGlow.color = brighten(c, GAME.GLOW_BALL_BRIGHTEN);
+    }
   }
 
   private updateBgColor() {
@@ -514,6 +722,144 @@ export class GameScene extends Phaser.Scene {
       alpha: 0,
       duration: GAME.SCORE_POPUP_DURATION_MS,
       ease: 'Quad.easeOut',
+      onComplete: () => text.destroy(),
+    });
+  }
+
+  // ニアミス: ボール位置を画面上で固定したまま、その点を中心にズームイン→保持→ズームアウト
+  private triggerNearMiss(focusX: number, focusY: number, pan: number) {
+    playNearMiss(pan);
+    vibrate([0, 25, 30, 60]);
+
+    // CLOSE! テキスト（凍結中も見えるよう即座に表示状態で生成）。ボーナス点も併記
+    const label = GAME.NEAR_MISS_BONUS > 0 ? `CLOSE!  +${GAME.NEAR_MISS_BONUS}` : 'CLOSE!';
+    this.nmText = this.add.text(focusX, focusY - 70, label, {
+      fontSize: '40px',
+      color: '#70d6ff',
+      fontStyle: 'bold',
+      padding: { top: 6, bottom: 4 },
+    }).setOrigin(0.5).setDepth(958).setAlpha(1).setScale(1);
+
+    // ズームの中心（ピボット）= ボールの現在位置。ここが画面上で動かない
+    this.nmPivotX = this.ball.x;
+    this.nmPivotY = this.ball.y;
+    this.nmElapsed = 0;
+    this.nmActive = true;
+
+    // 世界を停止（カメラズームだけ update で動かす）
+    this.frozen = true;
+    this.physics.world.pause();
+    this.tweens.pauseAll();
+  }
+
+  // 毎フレーム呼ばれ、ピボットを画面上で固定したままズーム倍率を時間で変化させる
+  private updateNearMissZoom(delta: number) {
+    this.nmElapsed += delta;
+    const IN = GAME.NEAR_MISS_ZOOM_IN_MS;
+    const HOLD = GAME.NEAR_MISS_HOLD_MS;
+    const OUT = GAME.NEAR_MISS_ZOOM_OUT_MS;
+    const Z = GAME.NEAR_MISS_ZOOM;
+    const t = this.nmElapsed;
+
+    let z: number;
+    if (t < IN) {
+      const p = t / IN;
+      z = 1 + (Z - 1) * (1 - (1 - p) * (1 - p)); // easeOut
+    } else if (t < IN + HOLD) {
+      z = Z;
+    } else if (t < IN + HOLD + OUT) {
+      const p = (t - IN - HOLD) / OUT;
+      z = Z + (1 - Z) * (p * p); // easeIn で 1 へ
+    } else {
+      this.applyPivotZoom(1);
+      this.endNearMiss();
+      return;
+    }
+    this.applyPivotZoom(z);
+  }
+
+  // ピボット (nmPivotX/Y) の画面位置を保ったままズーム倍率 z を適用
+  // 導出: screen = (world - scroll - mid) * z + mid を pivot で固定すると
+  //       scroll = (pivot - mid) * (1 - 1/z)
+  private applyPivotZoom(z: number) {
+    const cam = this.cameras.main;
+    cam.setZoom(z);
+    const sx = (this.nmPivotX - GAME.WIDTH / 2) * (1 - 1 / z);
+    const sy = (this.nmPivotY - GAME.HEIGHT / 2) * (1 - 1 / z);
+    cam.setScroll(sx, sy);
+  }
+
+  private endNearMiss() {
+    this.nmActive = false;
+    this.frozen = false;
+    const cam = this.cameras.main;
+    cam.setZoom(1);
+    cam.setScroll(0, 0);
+    this.physics.world.resume();
+    this.tweens.resumeAll();
+    if (this.nmText) {
+      const text = this.nmText;
+      this.nmText = null;
+      this.tweens.add({
+        targets: text,
+        alpha: 0,
+        scale: 1.3,
+        duration: 220,
+        ease: 'Quad.easeIn',
+        onComplete: () => text.destroy(),
+      });
+    }
+  }
+
+  // マイルストーン到達演出（prev→now でしきい値を跨いだら発動）
+  private checkMilestones(prevScore: number, nowScore: number) {
+    let reached: number | null = null;
+    while (
+      this.nextMilestoneIdx < GAME.MILESTONES.length &&
+      nowScore >= GAME.MILESTONES[this.nextMilestoneIdx]
+    ) {
+      reached = GAME.MILESTONES[this.nextMilestoneIdx];
+      this.nextMilestoneIdx += 1;
+    }
+    if (reached !== null && prevScore < reached) {
+      this.triggerMilestone(reached);
+    }
+  }
+
+  private triggerMilestone(value: number) {
+    playMilestone();
+    vibrate([0, 50, 40, 50, 40, 80]);
+    // 画面全体の彩度フラッシュ（淡い金色）
+    const flash = this.add.rectangle(
+      GAME.WIDTH / 2, GAME.HEIGHT / 2, GAME.WIDTH, GAME.HEIGHT, 0xffe070, 0.25,
+    ).setDepth(990);
+    this.tweens.add({
+      targets: flash, alpha: 0, duration: 400, ease: 'Quad.easeOut',
+      onComplete: () => flash.destroy(),
+    });
+    // 上部（スコアHUDの上）に配置。数字を上、その下に "MILESTONE"
+    const valueY = 250;
+    const labelY = 360;
+    const text = this.add.text(GAME.WIDTH / 2, valueY, `${value}`, {
+      fontSize: '150px',
+      color: '#ffe070',
+      fontStyle: 'bold',
+      padding: { top: 10, bottom: 8 },
+    }).setOrigin(0.5).setDepth(992).setAlpha(0).setScale(0.3);
+    const sub = this.add.text(GAME.WIDTH / 2, labelY, 'MILESTONE', {
+      fontSize: '46px',
+      color: '#ffffff',
+      fontStyle: 'bold',
+      padding: { top: 6, bottom: 4 },
+    }).setOrigin(0.5).setDepth(992).setAlpha(0);
+    this.tweens.add({ targets: sub, alpha: 1, duration: 200, yoyo: true, hold: GAME.MILESTONE_TEXT_MS - 600, onComplete: () => sub.destroy() });
+    this.tweens.chain({
+      targets: text,
+      tweens: [
+        { alpha: 1, scale: 1.15, duration: 250, ease: 'Back.easeOut' },
+        { scale: 1.0, duration: 150, ease: 'Quad.easeOut' },
+        { alpha: 0, scale: 1.3, duration: GAME.MILESTONE_TEXT_MS - 400, ease: 'Quad.easeIn' },
+      ],
       onComplete: () => text.destroy(),
     });
   }
@@ -585,8 +931,20 @@ export class GameScene extends Phaser.Scene {
     if (this.isGameOver) return;
     this.isGameOver = true;
 
+    // タイムダイレーションが残っていたら通常速度へ戻す
+    this.time.timeScale = 1;
+    this.tweens.timeScale = 1;
+    if (this.physics.world) this.physics.world.timeScale = 1;
+    this.frozen = false;
+    this.nmActive = false;
+    if (this.nmText) { this.nmText.destroy(); this.nmText = null; }
+    this.physics.world.resume(); // 万一フリーズ中なら解除
+    this.cameras.main.setZoom(1); // ニアミスズームが残っていたら戻す
+    this.cameras.main.setScroll(0, 0);
+
     this.stopWarning();
     muteFallSound();
+    stopMusic();
     const body = this.ball.body as Phaser.Physics.Arcade.Body | null;
     if (body) {
       body.setVelocity(0, 0);

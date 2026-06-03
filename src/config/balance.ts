@@ -36,7 +36,10 @@ export const GAME = {
   BALL_COLOR: 0xffeb70,                // ボールのデフォルト色（互換用、未使用化方向）
   BALL_COLOR_START: 0xffeb70,          // ボール初期色（黄色）
   BALL_COLOR_END: 0xff4830,            // ボール終端色（赤）
-  BALL_COLOR_RANGE_PX: 120,             // ボール直径が初期から+この値で終端色に到達
+  // ボール色は「ボール直径 / 現在の穴幅」の比率で決まる（穴に対する余裕度）。
+  // 比率が小さい（穴に対して余裕）= 開始色、比率が大きい（穴ギリギリ）= 終端色。
+  BALL_COLOR_RATIO_START: 0.4,          // この比率以下なら開始色（黄）のまま
+  BALL_COLOR_RATIO_END: 0.95,           // この比率以上で終端色（赤）に到達
   BG_COLOR: '#1a1a2e',                 // ゲーム全体のキャンバス背景色（Phaser config用、文字列）
   BG_COLOR_START: 0x1a1a2e,            // ゲーム中の背景初期色（青紫）
   BG_COLOR_END: 0x4a081f,              // ゲーム中の背景終端色（赤紫）
@@ -118,6 +121,54 @@ export const GAME = {
   // --- パーフェクト演出（ノーバウンス通過時） ---
   PERFECT_TEXT_DURATION_MS: 800,       // "PERFECT!"テキスト表示の総時間（ms）
   PERFECT_PARTICLE_COUNT: 18,          // パーフェクト時の追加パーティクル数
+
+  // --- ニアミス演出（ギリギリ通過）---
+  NEAR_MISS_CLEARANCE_PX: 14,          // ボール端〜ライン端の余白がこの値以下ならニアミス
+  NEAR_MISS_BONUS: 2,                   // ニアミス（CLOSE）通過時のボーナス加算
+  NEAR_MISS_ZOOM: 2.2,                 // ニアミス時のカメラズーム倍率（ボール位置を固定したまま寄る）
+  NEAR_MISS_ZOOM_IN_MS: 200,           // ズームインにかける時間（ms）
+  NEAR_MISS_HOLD_MS: 160,              // 最大ズームを保持する時間（ms、ストップモーション）
+  NEAR_MISS_ZOOM_OUT_MS: 280,          // ズームアウト（逆再生）にかける時間（ms）
+
+  // --- マイルストーン演出（スコア節目）---
+  MILESTONES: [10, 25, 50, 100, 200, 500] as number[], // この得点に到達で特別演出
+  MILESTONE_TEXT_MS: 1100,             // マイルストーンテキストの表示総時間（ms）
+
+  // --- タイムダイレーション（成功時のスローモーション）---
+  TIME_DILATION_SCALE: 0.35,           // 通過時に一瞬落とすゲーム速度（0.35=35%速度）
+  TIME_DILATION_HOLD_MS: 90,           // スロー状態を維持する実時間（ms）
+  TIME_DILATION_RECOVER_MS: 160,       // 通常速度に戻すまでの実時間（ms）
+
+  // --- グロー（発光）演出 ---
+  GLOW_BALL_BASE: 4,                   // ボールのグロー基準強度
+  GLOW_BALL_MAX: 16,                   // 終端色付近でのボール最大グロー強度
+  GLOW_LINE: 6,                        // ラインのグロー強度
+  GLOW_BALL_BRIGHTEN: 1.6,             // グロー色をボール色から何倍明るくするか（1=同色, >1=明るい同系色）
+  GLOW_PULSE_AMP: 3.5,                 // ボールのグロー強度の揺らぎ幅（±この値で増減）。0で揺らぎなし
+  GLOW_PULSE_FREQ: 4.5,                // ボールのグロー揺らぎの速さ（rad/s）。大きいほど速く明滅
+  GLOW_LINE_PULSE_AMP: 1.5,            // ラインのグロー揺らぎ幅（基準より小さく、ゼロにならない範囲）
+  GLOW_LINE_PULSE_FREQ: 2.0,           // ラインのグロー揺らぎの速さ（ボールより遅め）
+
+  // --- ステレオパン ---
+  AUDIO_PAN_STRENGTH: 0.85,            // ボールx位置→音の左右定位の強さ（0=モノ, 1=full）。※モノラルスピーカー機種では効果なし
+
+  // --- バウンド音の個性（1回ごとのばらつき）---
+  BOUNCE_DETUNE_JITTER: 120,           // バウンド音の音程ゆらぎ（±cents、120=約半音）
+  BOUNCE_VOLUME_JITTER: 0.4,           // バウンド音の音量ゆらぎ（±割合、0.4=±40%）
+  WALL_DETUNE_JITTER: 160,             // 壁音の音程ゆらぎ（±cents）
+
+  // --- BGM（procedural music）---
+  MUSIC_TEMPO: 104,                    // BGMのテンポ（BPM）
+  MUSIC_VOLUME: 0.5,                   // BGMバスの最大音量（0〜1、SFXとは独立）
+  MUSIC_INTENSITY_1: 6,                // スコアこの値以上でアルペジオ追加（intensity 1）
+  MUSIC_INTENSITY_2: 16,               // スコアこの値以上でハイハット追加（intensity 2）
+  MUSIC_INTENSITY_3: 32,               // スコアこの値以上で上声追加（intensity 3）
+
+  // --- 背景パララックス（奥行きのある動く背景）---
+  PARALLAX_DRIFT_SPEED: 1.0,           // 全体のドリフト速度倍率（大きいほど速く流れる）
+  PARALLAX_FAR_COUNT: 12,              // 遠景レイヤーの点の数
+  PARALLAX_MID_COUNT: 9,               // 中景レイヤーの点の数
+  PARALLAX_NEAR_COUNT: 6,              // 近景レイヤーの点の数
 };
 
 export const STORAGE_KEYS = {
