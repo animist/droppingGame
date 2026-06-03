@@ -32,7 +32,26 @@ export function audioIsRunning(): boolean {
   return !!ctx && ctx.state === 'running';
 }
 
+// 横向きポーズ中など、音全体（BGM + SFX + 落下音）を一括で停止/再開する。
+// AudioContext を suspend するとオシレーターも進行が止まり、resume で再開する。
+let manuallySuspended = false;
+export function setAudioSuspended(suspended: boolean) {
+  if (!ctx) return;
+  manuallySuspended = suspended;
+  if (suspended) {
+    if (ctx.state === 'running') ctx.suspend().catch(() => {});
+  } else if (ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
+  }
+}
+
+export function isAudioManuallySuspended(): boolean {
+  return manuallySuspended;
+}
+
 function tryResume() {
+  // 横向きポーズなどで手動サスペンド中は自動再開しない
+  if (manuallySuspended) return;
   if (ctx && ctx.state === 'suspended') {
     ctx.resume().catch(() => {});
   }

@@ -5,6 +5,7 @@ import { playBounce, playWall, playPass, playGameOver, playPerfectPass, playNear
 import { startMusic, stopMusic, setMusicIntensity, intensityFromScore } from '../audio/music';
 import { vibrate } from '../input/haptics';
 import { lerpColor, brighten } from '../util/color';
+import { getQuality } from '../config/quality';
 
 export class GameScene extends Phaser.Scene {
   private ball!: Phaser.GameObjects.Arc;
@@ -167,10 +168,13 @@ export class GameScene extends Phaser.Scene {
 
   // WebGL の Glow FX を安全に追加（Canvasレンダラーでは無視）。失敗してもゲームは続行。
   private addGlow(obj: Phaser.GameObjects.Shape, strength: number, color?: number): Phaser.FX.Glow | null {
+    // low ティアでは glow を完全に無効化（postFXの全画面パスが最大のボトルネック）
+    if (!getQuality().glow) return null;
     try {
       const fx = obj.postFX;
       if (!fx) return null;
-      return fx.addGlow(color, strength, 0, false, 0.1, 16);
+      // distance を 16→10 に抑えてサンプリングコストを軽減
+      return fx.addGlow(color, strength, 0, false, 0.1, 10);
     } catch {
       return null;
     }
@@ -391,12 +395,15 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    this.trailTimer += delta;
-    if (this.trailTimer >= GAME.TRAIL_INTERVAL_MS) {
-      this.trailTimer = 0;
-      const speed = Math.hypot(body.velocity.x, body.velocity.y);
-      if (speed > GAME.TRAIL_MIN_SPEED) {
-        this.spawnTrailDot();
+    const q = getQuality();
+    if (q.trailEnabled) {
+      this.trailTimer += delta;
+      if (this.trailTimer >= q.trailIntervalMs) {
+        this.trailTimer = 0;
+        const speed = Math.hypot(body.velocity.x, body.velocity.y);
+        if (speed > GAME.TRAIL_MIN_SPEED) {
+          this.spawnTrailDot();
+        }
       }
     }
 
@@ -884,7 +891,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   private emitBounceBurst(x: number, y: number) {
-    for (let i = 0; i < GAME.BOUNCE_PARTICLE_COUNT; i++) {
+    const n = Math.max(1, Math.round(GAME.BOUNCE_PARTICLE_COUNT * getQuality().particleScale));
+    for (let i = 0; i < n; i++) {
       const angle = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 0.7;
       const speed = Phaser.Math.FloatBetween(
         GAME.BOUNCE_PARTICLE_SPEED_MIN,
@@ -908,8 +916,9 @@ export class GameScene extends Phaser.Scene {
   }
 
   private emitBurst(x: number, y: number, count: number) {
-    for (let i = 0; i < count; i++) {
-      const baseAngle = (i / count) * Math.PI * 2;
+    const n = Math.max(1, Math.round(count * getQuality().particleScale));
+    for (let i = 0; i < n; i++) {
+      const baseAngle = (i / n) * Math.PI * 2;
       const angle = baseAngle + (Math.random() - 0.5) * 0.6;
       const speed = Phaser.Math.FloatBetween(GAME.PARTICLE_SPEED_MIN, GAME.PARTICLE_SPEED_MAX);
       const size = Phaser.Math.Between(3, 6);

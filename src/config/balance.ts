@@ -166,9 +166,9 @@ export const GAME = {
 
   // --- 背景パララックス（奥行きのある動く背景）---
   PARALLAX_DRIFT_SPEED: 1.0,           // 全体のドリフト速度倍率（大きいほど速く流れる）
-  PARALLAX_FAR_COUNT: 12,              // 遠景レイヤーの点の数
-  PARALLAX_MID_COUNT: 9,               // 中景レイヤーの点の数
-  PARALLAX_NEAR_COUNT: 6,              // 近景レイヤーの点の数
+  PARALLAX_FAR_COUNT: 24,              // 遠景レイヤーの点の数
+  PARALLAX_MID_COUNT: 18,               // 中景レイヤーの点の数
+  PARALLAX_NEAR_COUNT: 12,              // 近景レイヤーの点の数
 };
 
 export const STORAGE_KEYS = {
