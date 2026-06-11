@@ -1,16 +1,21 @@
 import Phaser from 'phaser';
 import { GAME, STORAGE_KEYS } from '../config/balance';
+import { FONT_FAMILY } from '../config/ui';
 import { tilt } from '../input/tilt';
-import { playBounce, playWall, playPass, playGameOver, playPerfectPass, playNearMiss, playMilestone, updateFallSound, muteFallSound } from '../audio/sfx';
-import { startMusic, stopMusic, setMusicIntensity, intensityFromScore } from '../audio/music';
+import { playBounce, playWall, playPass, playGameOver, playPerfectPass, playNearMiss, playMilestone, playBestBeaten, setMusicMuffled, updateFallSound, muteFallSound } from '../audio/sfx';
+import { startMusic, stopMusic, tapeStopMusic, setMusicIntensity, intensityFromScore } from '../audio/music';
 import { vibrate } from '../input/haptics';
 import { lerpColor, brighten } from '../util/color';
+import { addBackgroundShade, addWarningVignette } from '../util/bgShade';
 import { getQuality } from '../config/quality';
 
 export class GameScene extends Phaser.Scene {
   private ball!: Phaser.GameObjects.Arc;
+  private ballHighlight!: Phaser.GameObjects.Arc;  // 球体感を出す左上ハイライト
   private leftLine!: Phaser.GameObjects.Rectangle;
   private rightLine!: Phaser.GameObjects.Rectangle;
+  private leftMarker!: Phaser.GameObjects.Arc;     // 隙間の左端を示す発光点
+  private rightMarker!: Phaser.GameObjects.Arc;    // 隙間の右端を示す発光点
 
   private gapWidth = GAME.GAP_INITIAL;
   private gapCenterX = GAME.WIDTH / 2;
@@ -23,10 +28,19 @@ export class GameScene extends Phaser.Scene {
   private pointerLastX: number | null = null;
   private bgProgress = 0;
   private trailTimer = 0;
+  private ambientTimer = 0;            // 常時パーティクルの生成タイマー
   private warningActive = false;
   private warningTween: Phaser.Tweens.Tween | null = null;
+  private warnVignette: Phaser.GameObjects.Image | null = null;   // 警告中に脈動する赤ビネット
+  private warnVignetteTween: Phaser.Tweens.Tween | null = null;
+  private guideTexts: Phaser.GameObjects.Text[] = [];             // 初回プレイの操作ガイド
   private bounceCount = 0;
   private perfectStreak = 0;
+  private perfectCount = 0;          // このプレイでのPERFECT総数（リザルト内訳用）
+  private maxPerfectStreak = 0;      // PERFECT最大連続数（リザルト内訳用）
+  private nearMissCount = 0;         // CLOSE（ニアミス通過）総数（リザルト内訳用）
+  private prevBest = 0;              // プレイ開始時点の自己ベスト（ベスト超え演出用）
+  private bestBeaten = false;        // ベスト超え演出を発動済みか
   private gammaRest = 0;        // 持ち方の傾き癖を吸収するための中立値
   private gammaCalibrated = false;
   private ballGlow: Phaser.FX.Glow | null = null;
@@ -61,9 +75,23 @@ export class GameScene extends Phaser.Scene {
     this.pointerLastX = null;
     this.bgProgress = 0;
     this.trailTimer = 0;
+    this.ambientTimer = 0;
     this.warningActive = false;
+    this.warningTween = null;
+    this.warnVignette = null;
+    this.warnVignetteTween = null;
+    this.guideTexts = [];
     this.bounceCount = 0;
     this.perfectStreak = 0;
+    this.perfectCount = 0;
+    this.maxPerfectStreak = 0;
+    this.nearMissCount = 0;
+    this.bestBeaten = false;
+    try {
+      this.prevBest = Number(localStorage.getItem(STORAGE_KEYS.HIGH_SCORE) ?? 0);
+    } catch {
+      this.prevBest = 0;
+    }
     this.gammaRest = 0;
     this.gammaCalibrated = false;
     this.ballGlow = null;
@@ -86,8 +114,13 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.setBackgroundColor(GAME.BG_COLOR_START);
 
     this.createParallax();
+    // パララックス(-10)の手前・ゲームプレイ要素の奥に敷き、ドットごと薄く沈めて奥行きを出す
+    addBackgroundShade(this, -9);
+    // 警告用の赤ビネット（alpha 0 で常駐、警告中だけ脈動）
+    this.warnVignette = addWarningVignette(this, 930);
 
     this.scoreText = this.add.text(GAME.WIDTH / 2, 100, '0', {
+      fontFamily: FONT_FAMILY,
       fontSize: '120px',
       color: '#ffffff',
       fontStyle: 'bold',
@@ -99,12 +132,61 @@ export class GameScene extends Phaser.Scene {
     this.createLines();
     this.updateBallColor(); // 初期の穴比率に応じた色を反映
 
-    // BGM 開始
+    // BGM 開始（前回の警告こもりが残らないようフィルタを開いておく）
     this.musicIntensity = 0;
     setMusicIntensity(0);
+    setMusicMuffled(false);
     startMusic();
     this.events.once('shutdown', () => stopMusic());
     this.setupInput();
+
+    // 初回プレイ（累計プレイ回数 0）のときだけ操作ガイドを表示
+    let playCount = 1;
+    try {
+      playCount = Number(localStorage.getItem(STORAGE_KEYS.PLAY_COUNT) ?? 0);
+    } catch {
+      playCount = 1; // localStorage 不可なら毎回出さない側に倒す
+    }
+    if (playCount === 0) this.createFirstPlayGuide();
+  }
+
+  // 初回プレイの操作ガイド（最初の通過 or ゲームオーバーで消える）
+  private createFirstPlayGuide() {
+    const cx = GAME.WIDTH / 2;
+    const y = 760;
+    const style = (size: string, color = '#ffffff') => ({
+      fontFamily: FONT_FAMILY,
+      fontSize: size,
+      color,
+      fontStyle: 'bold',
+      padding: { top: 6, bottom: 4 },
+    });
+    const left = this.add.text(cx - 250, y, '←', style('48px')).setOrigin(0.5).setDepth(970).setAlpha(0.9);
+    const right = this.add.text(cx + 250, y, '→', style('48px')).setOrigin(0.5).setDepth(970).setAlpha(0.9);
+    const msg = this.add.text(cx, y, 'スワイプ / かたむけ', style('34px')).setOrigin(0.5).setDepth(970).setAlpha(0.9);
+    const sub = this.add.text(cx, y + 64, 'たまを すきまに とおそう', style('28px', '#aaaadd')).setOrigin(0.5).setDepth(970).setAlpha(0.85);
+    this.guideTexts = [left, right, msg, sub];
+
+    this.tweens.add({
+      targets: left, x: '-=24', duration: 600, yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+    });
+    this.tweens.add({
+      targets: right, x: '+=24', duration: 600, yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+    });
+  }
+
+  private dismissGuide() {
+    if (!this.guideTexts.length) return;
+    const texts = this.guideTexts;
+    this.guideTexts = [];
+    for (const t of texts) this.tweens.killTweensOf(t);
+    this.tweens.add({
+      targets: texts,
+      alpha: 0,
+      duration: 400,
+      ease: 'Quad.easeOut',
+      onComplete: () => texts.forEach((t) => t.destroy()),
+    });
   }
 
   private createBall() {
@@ -119,7 +201,53 @@ export class GameScene extends Phaser.Scene {
     body.setMaxVelocity(GAME.MAX_VELOCITY, GAME.MAX_VELOCITY);
     body.onWorldBounds = true;
     this.physics.world.on('worldbounds', this.onWallBounce, this);
-    this.ballGlow = this.addGlow(this.ball, GAME.GLOW_BALL_BASE, brighten(GAME.BALL_COLOR_START, GAME.GLOW_BALL_BRIGHTEN));
+    this.ballGlow = this.addGlow(
+      this.ball,
+      GAME.GLOW_BALL_BASE,
+      brighten(GAME.BALL_COLOR_START, GAME.GLOW_BALL_BRIGHTEN),
+      GAME.GLOW_BALL_DISTANCE,
+      GAME.GLOW_BALL_QUALITY,
+    );
+    // 左上の白ハイライト（ボール直後に生成して常にボールの上へ重ねる）。位置・大きさは update で追従
+    this.ballHighlight = this.add.circle(
+      this.ball.x - radius * 0.35, this.ball.y - radius * 0.35,
+      Math.max(2, radius * 0.28), 0xffffff, 0.3,
+    );
+  }
+
+  // ハイライトをボールの現在位置・変形（スクワッシュ／ストレッチ含む）に追従させる
+  private syncBallHighlight() {
+    if (!this.ballHighlight || !this.ball) return;
+    const r = this.ballDiameter / 2;
+    // オフセットは「光源が左上」の世界座標固定。大きさだけ平均スケールでならす
+    const meanScale = (this.ball.scaleX + this.ball.scaleY) / 2;
+    this.ballHighlight.setPosition(
+      this.ball.x - r * 0.35 * meanScale,
+      this.ball.y - r * 0.35 * meanScale,
+    );
+    this.ballHighlight.setRadius(Math.max(2, r * 0.28));
+    this.ballHighlight.setRotation(this.ball.rotation);
+    this.ballHighlight.setScale(this.ball.scaleX, this.ball.scaleY);
+  }
+
+  // 移動速度に応じてボールを進行方向に伸ばす（速いほど細長く）。
+  // スクワッシュ等の tween 中はそちらを優先する。
+  private applyVelocityStretch(body: Phaser.Physics.Arcade.Body) {
+    if (this.tweens.isTweening(this.ball)) return;
+    const speed = Math.hypot(body.velocity.x, body.velocity.y);
+    if (speed > GAME.STRETCH_MIN_SPEED) {
+      const t = Math.min(
+        1,
+        (speed - GAME.STRETCH_MIN_SPEED) / (GAME.STRETCH_MAX_SPEED - GAME.STRETCH_MIN_SPEED),
+      );
+      const s = GAME.STRETCH_MAX * t;
+      // 回転＝進行方向。ローカルX軸（scaleX）が進行方向に対応する
+      this.ball.setRotation(Math.atan2(body.velocity.y, body.velocity.x));
+      this.ball.setScale(1 + s, 1 - s * 0.6);
+    } else {
+      this.ball.setRotation(0);
+      this.ball.setScale(1);
+    }
   }
 
   // 背景の3層パララックス（奥行き感のあるドット群）
@@ -167,14 +295,20 @@ export class GameScene extends Phaser.Scene {
   }
 
   // WebGL の Glow FX を安全に追加（Canvasレンダラーでは無視）。失敗してもゲームは続行。
-  private addGlow(obj: Phaser.GameObjects.Shape, strength: number, color?: number): Phaser.FX.Glow | null {
+  // distance/quality でぼかし具合を調整できる（ボールは大きく柔らかく、ラインはシャープに）
+  private addGlow(
+    obj: Phaser.GameObjects.Shape,
+    strength: number,
+    color?: number,
+    distance = GAME.GLOW_DISTANCE,
+    quality = GAME.GLOW_QUALITY,
+  ): Phaser.FX.Glow | null {
     // low ティアでは glow を完全に無効化（postFXの全画面パスが最大のボトルネック）
     if (!getQuality().glow) return null;
     try {
       const fx = obj.postFX;
       if (!fx) return null;
-      // distance を 16→10 に抑えてサンプリングコストを軽減
-      return fx.addGlow(color, strength, 0, false, 0.1, 10);
+      return fx.addGlow(color, strength, 0, false, quality, distance);
     } catch {
       return null;
     }
@@ -200,12 +334,24 @@ export class GameScene extends Phaser.Scene {
     this.physics.add.existing(this.leftLine, true);
     this.physics.add.existing(this.rightLine, true);
 
+    // 隙間の端を示す発光マーカー（端の視認性UP）。位置は oscillateLines で追従
+    this.leftMarker = this.add.circle(
+      leftSegWidth, y, GAME.GAP_MARKER_RADIUS, GAME.GAP_MARKER_COLOR,
+    );
+    this.rightMarker = this.add.circle(
+      this.gapCenterX + gapHalf, y, GAME.GAP_MARKER_RADIUS, GAME.GAP_MARKER_COLOR,
+    );
+
     // 新ラインのグロー参照を保持（呼吸アニメ用、古い参照は破棄）
     this.lineGlows = [];
     const gl = this.addGlow(this.leftLine, GAME.GLOW_LINE);
     const gr = this.addGlow(this.rightLine, GAME.GLOW_LINE);
+    const gml = this.addGlow(this.leftMarker, GAME.GLOW_LINE);
+    const gmr = this.addGlow(this.rightMarker, GAME.GLOW_LINE);
     if (gl) this.lineGlows.push(gl);
     if (gr) this.lineGlows.push(gr);
+    if (gml) this.lineGlows.push(gml);
+    if (gmr) this.lineGlows.push(gmr);
 
     this.physics.add.collider(this.ball, this.leftLine, () => this.onBounce());
     this.physics.add.collider(this.ball, this.rightLine, () => this.onBounce());
@@ -227,6 +373,10 @@ export class GameScene extends Phaser.Scene {
     this.leftLine.x = newLeft / 2;
     this.rightLine.setSize(newRight, GAME.LINE_HEIGHT);
     this.rightLine.x = GAME.WIDTH - newRight / 2;
+
+    // 端マーカーをラインの内側端に追従させる（yは登場アニメ中のライン位置に合わせる）
+    this.leftMarker?.setPosition(newLeft, this.leftLine.y);
+    this.rightMarker?.setPosition(GAME.WIDTH - newRight, this.rightLine.y);
 
     (this.leftLine.body as Phaser.Physics.Arcade.StaticBody | null)?.updateFromGameObject();
     (this.rightLine.body as Phaser.Physics.Arcade.StaticBody | null)?.updateFromGameObject();
@@ -301,6 +451,8 @@ export class GameScene extends Phaser.Scene {
 
   private squashBall() {
     this.tweens.killTweensOf(this.ball);
+    // スクワッシュは水平ライン基準の変形なので、ストレッチの回転を戻してから行う
+    this.ball.setRotation(0);
     this.ball.setScale(GAME.SQUASH_SCALE_X, GAME.SQUASH_SCALE_Y);
     this.tweens.chain({
       targets: this.ball,
@@ -359,6 +511,9 @@ export class GameScene extends Phaser.Scene {
     // パララックスは演出なので常に更新（スクロール中・ゲームオーバー後も動かす）
     this.updateParallax(delta);
 
+    // ハイライトはスクロール復帰tween中もボールに追従させる
+    this.syncBallHighlight();
+
     // グロー強度を sin で揺らがせて「呼吸する発光」にする
     if (this.ballGlow) {
       const pulse = Math.sin(_time * 0.001 * GAME.GLOW_PULSE_FREQ) * GAME.GLOW_PULSE_AMP;
@@ -395,6 +550,8 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
+    this.applyVelocityStretch(body);
+
     const q = getQuality();
     if (q.trailEnabled) {
       this.trailTimer += delta;
@@ -404,6 +561,16 @@ export class GameScene extends Phaser.Scene {
         if (speed > GAME.TRAIL_MIN_SPEED) {
           this.spawnTrailDot();
         }
+      }
+    }
+
+    // 常時パーティクル: 移動中はきらめく粒を撒く（コンボ中は数が増え金色が混ざる）
+    this.ambientTimer += delta;
+    if (this.ambientTimer >= GAME.AMBIENT_INTERVAL_MS) {
+      this.ambientTimer = 0;
+      const speed = Math.hypot(body.velocity.x, body.velocity.y);
+      if (speed > GAME.AMBIENT_MIN_SPEED) {
+        this.emitAmbient(body);
       }
     }
 
@@ -433,6 +600,7 @@ export class GameScene extends Phaser.Scene {
   private onPassThroughGap(clearance = Infinity, focusX = GAME.WIDTH / 2) {
     this.hasPassedGap = true;
     this.isScrolling = true;
+    this.dismissGuide();
 
     const isNearMiss = clearance <= GAME.NEAR_MISS_CLEARANCE_PX;
     const isPerfect = this.bounceCount === 0;
@@ -442,6 +610,11 @@ export class GameScene extends Phaser.Scene {
     // 連続パーフェクトの計数を先に更新（コンボボーナスの算出で使う）
     if (isPerfect) {
       this.perfectStreak += 1;
+      this.perfectCount += 1;
+      this.maxPerfectStreak = Math.max(this.maxPerfectStreak, this.perfectStreak);
+    }
+    if (isNearMiss) {
+      this.nearMissCount += 1;
     }
 
     let points = isPerfect ? 1 + GAME.NO_BOUNCE_BONUS : 1;
@@ -472,6 +645,11 @@ export class GameScene extends Phaser.Scene {
     // マイルストーン到達チェック（1回の通過で複数跨いだ場合は最高位を採用）
     this.checkMilestones(prevScore, this.score);
 
+    // 自己ベスト超えチェック（初回プレイ=ベスト0のときは Result の NEW BEST に任せる）
+    if (!this.bestBeaten && this.prevBest > 0 && this.score > this.prevBest) {
+      this.triggerBestBeaten();
+    }
+
     this.stopWarning();
     this.popScore();
     this.flashScreen();
@@ -494,18 +672,24 @@ export class GameScene extends Phaser.Scene {
 
     const body = this.ball.body as Phaser.Physics.Arcade.Body;
     body.enable = false;
+    // ベロシティストレッチの変形をリセット（スクロール中は等速で見せる）
+    this.ball.setRotation(0).setScale(1);
 
     const oldLeft = this.leftLine;
     const oldRight = this.rightLine;
+    const oldMarkerL = this.leftMarker;
+    const oldMarkerR = this.rightMarker;
 
     this.tweens.add({
-      targets: [oldLeft, oldRight],
+      targets: [oldLeft, oldRight, oldMarkerL, oldMarkerR],
       y: -GAME.LINE_HEIGHT,
       duration: GAME.SCROLL_DURATION,
       ease: 'Cubic.easeIn',
       onComplete: () => {
         oldLeft.destroy();
         oldRight.destroy();
+        oldMarkerL.destroy();
+        oldMarkerR.destroy();
       },
     });
 
@@ -548,8 +732,10 @@ export class GameScene extends Phaser.Scene {
 
         this.leftLine.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
         this.rightLine.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
+        this.leftMarker.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
+        this.rightMarker.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
         this.tweens.add({
-          targets: [this.leftLine, this.rightLine],
+          targets: [this.leftLine, this.rightLine, this.leftMarker, this.rightMarker],
           y: GAME.LINE_Y,
           duration: GAME.LINE_ENTER_DURATION_MS,
           ease: 'Back.easeOut',
@@ -598,6 +784,35 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
+  // 落下中のきらめき。ボールの縁から粒を散らし、進行と逆方向+ランダムに漂わせて消す。
+  // PERFECTコンボ1につき粒が+1個（上限あり）、コンボ中は金色の粒が混ざる。
+  private emitAmbient(body: Phaser.Physics.Arcade.Body) {
+    const extra = Math.min(this.perfectStreak, GAME.AMBIENT_STREAK_MAX);
+    const n = Math.max(1, Math.round((1 + extra) * getQuality().particleScale));
+    const r = this.ballDiameter / 2;
+    for (let i = 0; i < n; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const px = this.ball.x + Math.cos(ang) * r * 0.8;
+      const py = this.ball.y + Math.sin(ang) * r * 0.8;
+      const gold = this.perfectStreak > 0 && Math.random() < GAME.AMBIENT_GOLD_RATIO;
+      const color = gold ? 0xffd700 : this.ball.fillColor;
+      const size = Phaser.Math.Between(GAME.AMBIENT_SIZE_MIN, GAME.AMBIENT_SIZE_MAX);
+      const p = this.add.circle(px, py, size, color, 0.85).setDepth(this.ball.depth - 1);
+      const driftX = (Math.random() - 0.5) * GAME.AMBIENT_DRIFT_PX - body.velocity.x * 0.04;
+      const driftY = (Math.random() - 0.5) * GAME.AMBIENT_DRIFT_PX - body.velocity.y * 0.06;
+      this.tweens.add({
+        targets: p,
+        x: px + driftX,
+        y: py + driftY,
+        alpha: 0,
+        scale: 0.2,
+        duration: GAME.AMBIENT_DURATION_MS,
+        ease: 'Quad.easeOut',
+        onComplete: () => p.destroy(),
+      });
+    }
+  }
+
   private spawnTrailDot() {
     const radius = this.ballDiameter / 2;
     const dot = this.add.circle(
@@ -627,7 +842,7 @@ export class GameScene extends Phaser.Scene {
     if (this.warningActive) return;
     this.warningActive = true;
     this.warningTween = this.tweens.add({
-      targets: [this.leftLine, this.rightLine],
+      targets: [this.leftLine, this.rightLine, this.leftMarker, this.rightMarker],
       alpha: 0.35,
       duration: GAME.WARNING_PULSE_DURATION_MS,
       yoyo: true,
@@ -636,6 +851,21 @@ export class GameScene extends Phaser.Scene {
     });
     this.leftLine.setFillStyle(0xff4830);
     this.rightLine.setFillStyle(0xff4830);
+    this.leftMarker?.setFillStyle(0xff4830);
+    this.rightMarker?.setFillStyle(0xff4830);
+
+    // 画面周辺の赤ビネットを脈動させ、BGMをこもらせて緊張感を立体化する
+    if (this.warnVignette) {
+      this.warnVignetteTween = this.tweens.add({
+        targets: this.warnVignette,
+        alpha: GAME.WARNING_VIGNETTE_ALPHA,
+        duration: GAME.WARNING_PULSE_DURATION_MS,
+        yoyo: true,
+        repeat: -1,
+        ease: 'Sine.easeInOut',
+      });
+    }
+    setMusicMuffled(true);
   }
 
   private stopWarning() {
@@ -649,6 +879,16 @@ export class GameScene extends Phaser.Scene {
     this.rightLine?.setAlpha(1);
     this.leftLine?.setFillStyle(GAME.LINE_COLOR);
     this.rightLine?.setFillStyle(GAME.LINE_COLOR);
+    this.leftMarker?.setAlpha(1);
+    this.rightMarker?.setAlpha(1);
+    this.leftMarker?.setFillStyle(GAME.GAP_MARKER_COLOR);
+    this.rightMarker?.setFillStyle(GAME.GAP_MARKER_COLOR);
+    if (this.warnVignetteTween) {
+      this.warnVignetteTween.stop();
+      this.warnVignetteTween = null;
+    }
+    this.warnVignette?.setAlpha(0);
+    setMusicMuffled(false);
   }
 
   // ボール色の進行度 t (0=開始色、1=終端色)。「ボール直径 / 穴幅」の比率で決まる
@@ -719,6 +959,7 @@ export class GameScene extends Phaser.Scene {
       color = '#ffeb70'; // 通常 黄
     }
     const text = this.add.text(x, y, `+${points}`, {
+      fontFamily: FONT_FAMILY,
       fontSize,
       color,
       fontStyle: 'bold',
@@ -741,6 +982,7 @@ export class GameScene extends Phaser.Scene {
     // CLOSE! テキスト（凍結中も見えるよう即座に表示状態で生成）。ボーナス点も併記
     const label = GAME.NEAR_MISS_BONUS > 0 ? `CLOSE!  +${GAME.NEAR_MISS_BONUS}` : 'CLOSE!';
     this.nmText = this.add.text(focusX, focusY - 70, label, {
+      fontFamily: FONT_FAMILY,
       fontSize: '40px',
       color: '#70d6ff',
       fontStyle: 'bold',
@@ -818,6 +1060,31 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // 自己ベスト超え演出（1プレイ1回。以後スコアHUDが金色のままになる）
+  private triggerBestBeaten() {
+    this.bestBeaten = true;
+    playBestBeaten();
+    vibrate([0, 30, 30, 60]);
+    this.scoreText.setColor('#ffd700');
+
+    const text = this.add.text(GAME.WIDTH / 2, 195, 'NEW BEST!', {
+      fontFamily: FONT_FAMILY,
+      fontSize: '44px',
+      color: '#ffd700',
+      fontStyle: 'bold',
+      padding: { top: 6, bottom: 4 },
+    }).setOrigin(0.5).setDepth(955).setAlpha(0).setScale(0.5);
+    this.tweens.chain({
+      targets: text,
+      tweens: [
+        { alpha: 1, scale: 1.1, duration: 220, ease: 'Back.easeOut' },
+        { scale: 1.0, duration: 120, ease: 'Quad.easeOut' },
+        { alpha: 0, scale: 1.15, duration: 500, delay: 900, ease: 'Quad.easeIn' },
+      ],
+      onComplete: () => text.destroy(),
+    });
+  }
+
   // マイルストーン到達演出（prev→now でしきい値を跨いだら発動）
   private checkMilestones(prevScore: number, nowScore: number) {
     let reached: number | null = null;
@@ -848,12 +1115,14 @@ export class GameScene extends Phaser.Scene {
     const valueY = 250;
     const labelY = 360;
     const text = this.add.text(GAME.WIDTH / 2, valueY, `${value}`, {
+      fontFamily: FONT_FAMILY,
       fontSize: '150px',
       color: '#ffe070',
-      fontStyle: 'bold',
+      fontStyle: '800',
       padding: { top: 10, bottom: 8 },
     }).setOrigin(0.5).setDepth(992).setAlpha(0).setScale(0.3);
     const sub = this.add.text(GAME.WIDTH / 2, labelY, 'MILESTONE', {
+      fontFamily: FONT_FAMILY,
       fontSize: '46px',
       color: '#ffffff',
       fontStyle: 'bold',
@@ -874,9 +1143,10 @@ export class GameScene extends Phaser.Scene {
   private spawnPerfectText(streak: number) {
     const label = streak > 1 ? `PERFECT!×${streak}` : 'PERFECT!';
     const text = this.add.text(GAME.WIDTH / 2, GAME.HEIGHT / 2 - 80, label, {
+      fontFamily: FONT_FAMILY,
       fontSize: '88px',
       color: '#ffd700',
-      fontStyle: 'bold',
+      fontStyle: '800',
       padding: { top: 8, bottom: 6 },
     }).setOrigin(0.5).setDepth(960).setAlpha(0).setScale(0.4);
     this.tweens.chain({
@@ -952,8 +1222,9 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.setScroll(0, 0);
 
     this.stopWarning();
+    this.dismissGuide();
     muteFallSound();
-    stopMusic();
+    tapeStopMusic(); // BGMはピッチが落ちながら止まる（テープストップ）
     const body = this.ball.body as Phaser.Physics.Arcade.Body | null;
     if (body) {
       body.setVelocity(0, 0);
@@ -971,12 +1242,92 @@ export class GameScene extends Phaser.Scene {
       // localStorage may be unavailable (private mode, etc.) — skip persistence
     }
 
+    // --- 死の演出 ---
+    // 1) ボールが破裂して飛び散る
+    this.explodeBall();
+
+    // 2) 背景の彩度が抜ける（暗幕をかぶせて世界から色味を奪う）
+    const desat = this.add.rectangle(
+      GAME.WIDTH / 2, GAME.HEIGHT / 2, GAME.WIDTH, GAME.HEIGHT,
+      0x0a0a12, GAME.DEATH_DESAT_ALPHA,
+    ).setDepth(940).setAlpha(0);
+    this.tweens.add({
+      targets: desat, alpha: 1, duration: 450, ease: 'Quad.easeOut',
+    });
+
+    // 3) なぜ死んだかの比較表示: 隙間の位置にボール直径のゴーストを重ねて
+    //    「ボールが隙間より大きい」ことを見せる（サイズ起因の死のみ）
+    if (this.ballDiameter > this.gapWidth) {
+      const ghost = this.add.circle(
+        this.gapCenterX, GAME.LINE_Y, this.ballDiameter / 2, 0xff4830, 0.28,
+      ).setStrokeStyle(3, 0xff7060, 0.9).setDepth(945).setAlpha(0);
+      // ラベル全幅（約360px）が画面内に収まるよう中央へ寄せる
+      const labelX = Phaser.Math.Clamp(this.gapCenterX, 200, GAME.WIDTH - 200);
+      const label = this.add.text(
+        labelX, GAME.LINE_Y - this.ballDiameter / 2 - 64,
+        `BALL ${Math.round(this.ballDiameter)}  >  GAP ${Math.round(this.gapWidth)}`,
+        {
+          fontFamily: FONT_FAMILY,
+          fontSize: '36px',
+          color: '#ff9080',
+          fontStyle: 'bold',
+          padding: { top: 6, bottom: 4 },
+        },
+      ).setOrigin(0.5).setDepth(946).setAlpha(0);
+      this.tweens.add({
+        targets: [ghost, label], alpha: 1, duration: 350, delay: 250, ease: 'Quad.easeOut',
+      });
+    }
+
+    // 4) 一瞬のスローモーション（破裂・暗転の tween をゆっくり見せ、実時間で復帰）
+    this.tweens.timeScale = GAME.DEATH_SLOWMO_SCALE;
+    window.setTimeout(() => {
+      if (this.scene.isActive()) this.tweens.timeScale = 1;
+    }, GAME.DEATH_SLOWMO_MS);
+
     this.cameras.main.shake(GAME.SHAKE_GAMEOVER_DURATION_MS, GAME.SHAKE_GAMEOVER_INTENSITY);
     playGameOver();
     vibrate([0, 60, 30, 120]);
 
-    this.time.delayedCall(700, () => {
-      this.scene.start('Result', { score: this.score });
+    this.time.delayedCall(GAME.DEATH_RESULT_DELAY_MS, () => {
+      this.scene.start('Result', {
+        score: this.score,
+        perfects: this.perfectCount,
+        maxStreak: this.maxPerfectStreak,
+        closes: this.nearMissCount,
+      });
     });
+  }
+
+  // ボールの破裂: 本体を隠し、ボール色の破片を放射状に飛ばす（少し落下感を付ける）
+  private explodeBall() {
+    const x = this.ball.x;
+    const y = this.ball.y;
+    const color = this.ball.fillColor;
+    this.tweens.killTweensOf(this.ball);
+    this.ball.setVisible(false);
+    this.ballHighlight.setVisible(false);
+
+    const n = Math.max(8, Math.round(GAME.DEATH_PARTICLE_COUNT * getQuality().particleScale));
+    for (let i = 0; i < n; i++) {
+      const angle = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.8;
+      const speed = Phaser.Math.FloatBetween(
+        GAME.DEATH_PARTICLE_SPEED_MIN,
+        GAME.DEATH_PARTICLE_SPEED_MAX,
+      );
+      const size = Phaser.Math.Between(3, 8);
+      const c = Math.random() < 0.25 ? 0xffffff : color;
+      const p = this.add.circle(x, y, size, c).setDepth(900);
+      this.tweens.add({
+        targets: p,
+        x: x + Math.cos(angle) * speed * 0.6,
+        y: y + Math.sin(angle) * speed * 0.6 + 60,
+        alpha: 0,
+        scale: 0.2,
+        duration: GAME.DEATH_PARTICLE_DURATION_MS,
+        ease: 'Quad.easeOut',
+        onComplete: () => p.destroy(),
+      });
+    }
   }
 }

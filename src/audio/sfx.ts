@@ -3,6 +3,7 @@ import { GAME } from '../config/balance';
 let ctx: AudioContext | null = null;
 let masterGain: GainNode | null = null;
 let musicGain: GainNode | null = null;
+let fxSend: GainNode | null = null;
 let autoResumeHookInstalled = false;
 
 function ensure(): AudioContext {
@@ -12,20 +13,60 @@ function ensure(): AudioContext {
     masterGain = ctx.createGain();
     masterGain.gain.value = 0.5;
     masterGain.connect(ctx.destination);
+    ensureFxBus(ctx, masterGain);
   }
   installAutoResumeHook();
   return ctx;
 }
 
-// BGM 用の独立した音量バス（SFX とは別系統で音量調整可能）
+// ワンショット効果音用のフィードバックディレイ（センドバス）。
+// tone() の出力を薄くここへ送り、合成音に空間的なまとまりを与える。
+// 落下音（連続）と BGM はにごるためセンドしない。
+function ensureFxBus(c: AudioContext, master: GainNode) {
+  if (fxSend) return;
+  if (GAME.AUDIO_DELAY_SEND <= 0) return; // 0 なら作らない（完全ドライ）
+  fxSend = c.createGain();
+  fxSend.gain.value = GAME.AUDIO_DELAY_SEND;
+  const delay = c.createDelay(1);
+  delay.delayTime.value = GAME.AUDIO_DELAY_TIME_S;
+  const lp = c.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = GAME.AUDIO_DELAY_TONE_HZ;
+  const fb = c.createGain();
+  fb.gain.value = GAME.AUDIO_DELAY_FEEDBACK;
+  // send → delay → lowpass → master（聴こえる山びこ）
+  //                  └→ feedback → delay（繰り返し。ローパス越しなので回るほどこもる）
+  fxSend.connect(delay);
+  delay.connect(lp);
+  lp.connect(fb);
+  fb.connect(delay);
+  lp.connect(master);
+}
+
+// BGM 用の独立した音量バス（SFX とは別系統で音量調整可能）。
+// 出口にローパスフィルタを常設し、危険警告中の「こもり」演出に使う（通常時は全開）。
+let musicFilter: BiquadFilterNode | null = null;
+const MUSIC_FILTER_OPEN_HZ = 18000;
+
 export function getMusicBus(): { ctx: AudioContext; bus: GainNode } | null {
   const c = ensure();
   if (!musicGain) {
     musicGain = c.createGain();
     musicGain.gain.value = 0;
-    musicGain.connect(c.destination);
+    musicFilter = c.createBiquadFilter();
+    musicFilter.type = 'lowpass';
+    musicFilter.frequency.value = MUSIC_FILTER_OPEN_HZ;
+    musicGain.connect(musicFilter);
+    musicFilter.connect(c.destination);
   }
   return { ctx: c, bus: musicGain };
+}
+
+// 危険警告中などに BGM をこもらせる（true でローパス、false で全開に戻す）
+export function setMusicMuffled(muffled: boolean) {
+  if (!ctx || !musicFilter) return;
+  const target = muffled ? GAME.MUSIC_MUFFLE_HZ : MUSIC_FILTER_OPEN_HZ;
+  musicFilter.frequency.setTargetAtTime(target, ctx.currentTime, 0.15);
 }
 
 export function audioIsRunning(): boolean {
@@ -132,14 +173,15 @@ function tone(opts: ToneOpts) {
 
   osc.connect(gain);
   // ステレオパンが指定されていれば PannerNode を挟む
+  let out: AudioNode = gain;
   if (opts.pan !== undefined && typeof ctx.createStereoPanner === 'function') {
     const panner = ctx.createStereoPanner();
     panner.pan.setValueAtTime(Math.max(-1, Math.min(1, opts.pan)), now);
     gain.connect(panner);
-    panner.connect(masterGain);
-  } else {
-    gain.connect(masterGain);
+    out = panner;
   }
+  out.connect(masterGain);          // ドライ
+  if (fxSend) out.connect(fxSend);  // ウェット（ディレイへ薄くセンド）
   osc.start(now);
   osc.stop(now + opts.duration + 0.05);
 }
@@ -172,6 +214,14 @@ export function playPass(pan = 0) {
 export function playNearMiss(pan = 0) {
   tone({ freq: 600, freqEnd: 1500, duration: 0.16, type: 'sawtooth', volume: 0.16, pan });
   setTimeout(() => tone({ freq: 1800, duration: 0.10, type: 'sine', volume: 0.14, pan }), 90);
+}
+
+// ベスト超え: プレイ中に自己ベストを上回った瞬間の短い祝福チャイム
+// （マイルストーンより軽く、通過音より特別に）
+export function playBestBeaten() {
+  tone({ freq: 1046.5, duration: 0.12, type: 'triangle', volume: 0.2 });   // C6
+  setTimeout(() => tone({ freq: 1568.0, duration: 0.26, type: 'triangle', volume: 0.2 }), 100); // G6
+  setTimeout(() => tone({ freq: 2093.0, duration: 0.40, type: 'sine', volume: 0.12 }), 200);    // C7 きらめき
 }
 
 // マイルストーン: 明るく開けた上昇ファンファーレ（メジャーアルペジオ）

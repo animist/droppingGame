@@ -5,7 +5,8 @@ export default defineConfig({
   base: './',
   server: {
     host: true,
-    port: 5173,
+    // PORT 環境変数があれば優先（プレビューツール等の自動ポート割り当て用）
+    port: Number(process.env.PORT) || 5173,
     allowedHosts: ['.trycloudflare.com', 'localhost'],
   },
   build: {

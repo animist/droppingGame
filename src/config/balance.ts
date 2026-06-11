@@ -96,6 +96,16 @@ export const GAME = {
   SCORE_POPUP_RISE_PX: 120,            // +1テキストが何px浮上するか
   SCORE_POPUP_DURATION_MS: 700,        // +1テキストが消えるまでの時間（ms）
 
+  // --- 常時パーティクル（落下中のきらめき） ---
+  AMBIENT_INTERVAL_MS: 90,             // 粒を撒く間隔（ms）。小さいほど密
+  AMBIENT_MIN_SPEED: 120,              // この速度（px/s）未満では撒かない（ほぼ静止中は出さない）
+  AMBIENT_SIZE_MIN: 2,                 // 粒の最小半径（px）
+  AMBIENT_SIZE_MAX: 4,                 // 粒の最大半径（px）
+  AMBIENT_DURATION_MS: 550,            // 粒が消えるまでの時間（ms）
+  AMBIENT_DRIFT_PX: 70,                // 粒がランダムに漂う距離（px）
+  AMBIENT_STREAK_MAX: 6,               // PERFECTコンボによる追加粒数の上限（1コンボ=+1粒）
+  AMBIENT_GOLD_RATIO: 0.6,             // コンボ中に金色の粒が混ざる割合（0〜1）
+
   // --- ボールのトレイル（残像） ---
   TRAIL_INTERVAL_MS: 30,               // 残像を1個生成する間隔（ms）。小さいほど密
   TRAIL_DURATION_MS: 280,              // 残像1個が消えるまでの時間（ms）
@@ -105,6 +115,27 @@ export const GAME = {
   // --- 危険警告（隙間ギリギリの時の線の点滅） ---
   WARNING_THRESHOLD: 0.85,             // ボール直径/隙間幅 がこの比率を超えたら警告開始
   WARNING_PULSE_DURATION_MS: 400,      // 警告点滅の1サイクル時間（ms）
+  WARNING_VIGNETTE_ALPHA: 0.22,        // 警告中に脈動する赤ビネットの最大不透明度（0で無効）
+  MUSIC_MUFFLE_HZ: 420,                // 警告中にBGMへかけるローパスの周波数（Hz）。低いほどこもる
+
+  // --- 隙間端マーカー（ラインの内側端の発光点） ---
+  GAP_MARKER_RADIUS: 7,                // マーカーの半径（px）。隙間の端の視認性を上げる
+  GAP_MARKER_COLOR: 0xbff0ff,          // マーカーの色（ライン色より明るい水色）
+
+  // --- ベロシティストレッチ（移動中のボール変形） ---
+  STRETCH_MIN_SPEED: 240,              // この速度（px/s）未満では変形しない
+  STRETCH_MAX_SPEED: 1500,             // この速度で伸びが最大になる
+  STRETCH_MAX: 0.22,                   // 最大伸び率（0.22=進行方向に+22%、直交方向は6割相当つぶれ）
+
+  // --- 死亡演出 ---
+  DEATH_PARTICLE_COUNT: 26,            // ボール破裂時のパーティクル数
+  DEATH_PARTICLE_SPEED_MIN: 250,       // 破裂パーティクルの速度下限
+  DEATH_PARTICLE_SPEED_MAX: 700,       // 破裂パーティクルの速度上限
+  DEATH_PARTICLE_DURATION_MS: 700,     // 破裂パーティクルが消えるまでの時間（ms）
+  DEATH_SLOWMO_SCALE: 0.5,             // 死亡直後の演出スロー倍率（tweenのみ減速）
+  DEATH_SLOWMO_MS: 280,                // スローを維持する実時間（ms）
+  DEATH_DESAT_ALPHA: 0.45,             // 彩度抜きオーバーレイ（暗幕）の最終不透明度
+  DEATH_RESULT_DELAY_MS: 1500,         // ゲームオーバーから Result へ遷移するまでの時間（ms）
 
   // --- 落下音（風切り音、速度連動） ---
   FALL_SOUND_MAX_VELOCITY: 800,        // この下向き速度で音量・周波数が最大になる
@@ -142,6 +173,10 @@ export const GAME = {
   // --- グロー（発光）演出 ---
   GLOW_BALL_BASE: 4,                   // ボールのグロー基準強度
   GLOW_BALL_MAX: 16,                   // 終端色付近でのボール最大グロー強度
+  GLOW_BALL_DISTANCE: 26,              // ボールのグロー拡散距離（px）。大きいほどボヤッと広がる
+  GLOW_BALL_QUALITY: 0.2,              // ボールのグローのサンプル品質（0〜1）。距離を伸ばすほど上げないと縞が出る
+  GLOW_DISTANCE: 10,                   // ライン等のグロー拡散距離（px）。控えめでシャープ
+  GLOW_QUALITY: 0.1,                   // ライン等のグローのサンプル品質
   GLOW_LINE: 6,                        // ラインのグロー強度
   GLOW_BALL_BRIGHTEN: 1.6,             // グロー色をボール色から何倍明るくするか（1=同色, >1=明るい同系色）
   GLOW_PULSE_AMP: 3.5,                 // ボールのグロー強度の揺らぎ幅（±この値で増減）。0で揺らぎなし
@@ -151,6 +186,13 @@ export const GAME = {
 
   // --- ステレオパン ---
   AUDIO_PAN_STRENGTH: 0.85,            // ボールx位置→音の左右定位の強さ（0=モノ, 1=full）。※モノラルスピーカー機種では効果なし
+
+  // --- 効果音の空間系（フィードバックディレイのセンドバス）---
+  // ワンショット効果音だけを薄く山びこさせ、合成音の「素のまま感」を消す。落下音・BGMはドライのまま。
+  AUDIO_DELAY_TIME_S: 0.16,            // ディレイタイム（秒）。テンポ感に合わせて 0.12〜0.25 程度
+  AUDIO_DELAY_FEEDBACK: 0.30,          // 山びこの繰り返し量（0〜1）。大きいほど長く残る
+  AUDIO_DELAY_TONE_HZ: 1800,           // ディレイ音のローパス周波数。低いほどこもった残響になる
+  AUDIO_DELAY_SEND: 0.22,              // 原音に対するセンド量（0=無効）。上げすぎると音像がぼやける
 
   // --- バウンド音の個性（1回ごとのばらつき）---
   BOUNCE_DETUNE_JITTER: 120,           // バウンド音の音程ゆらぎ（±cents、120=約半音）

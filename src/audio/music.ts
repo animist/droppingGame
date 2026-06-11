@@ -34,6 +34,9 @@ const ARP: number[] = [
 ];
 const HAT_STEPS = [2, 6, 10, 14];
 
+// テープストップ用に「現在鳴っている（またはスケジュール済みの）」オシレーターを追跡する
+const activeNotes = new Set<OscillatorNode>();
+
 function playNote(
   ctx: AudioContext,
   bus: GainNode,
@@ -54,6 +57,8 @@ function playNote(
   g.connect(bus);
   osc.start(time);
   osc.stop(time + dur + 0.03);
+  activeNotes.add(osc);
+  osc.onended = () => activeNotes.delete(osc);
 }
 
 function playHat(ctx: AudioContext, bus: GainNode, time: number) {
@@ -129,6 +134,33 @@ export function stopMusic() {
     bus.gain.setValueAtTime(bus.gain.value, ctx.currentTime);
     bus.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.35);
   }
+}
+
+// テープストップ: 鳴っている全ノートのピッチを2オクターブ落としながら音量を絞る
+// （ゲームオーバーの「死の演出」用。レコードの回転が止まる感じ）
+export function tapeStopMusic() {
+  if (!running) return;
+  running = false;
+  if (schedulerId !== null) {
+    clearInterval(schedulerId);
+    schedulerId = null;
+  }
+  const mb = getMusicBus();
+  if (!mb) return;
+  const { ctx, bus } = mb;
+  const now = ctx.currentTime;
+  for (const osc of activeNotes) {
+    try {
+      osc.detune.cancelScheduledValues(now);
+      osc.detune.setValueAtTime(osc.detune.value, now);
+      osc.detune.linearRampToValueAtTime(-2400, now + 0.45);
+    } catch {
+      // 既に停止済みのノードは無視
+    }
+  }
+  bus.gain.cancelScheduledValues(now);
+  bus.gain.setValueAtTime(bus.gain.value, now);
+  bus.gain.linearRampToValueAtTime(0, now + 0.5);
 }
 
 export function setMusicIntensity(level: number) {

@@ -1,7 +1,9 @@
 import Phaser from 'phaser';
 import { GAME, STORAGE_KEYS } from '../config/balance';
+import { FONT_FAMILY } from '../config/ui';
 import { enableTilt } from '../input/tilt';
 import { unlockAudio } from '../audio/sfx';
+import { addBackgroundShade } from '../util/bgShade';
 
 export class TitleScene extends Phaser.Scene {
   constructor() {
@@ -12,6 +14,7 @@ export class TitleScene extends Phaser.Scene {
     const cx = GAME.WIDTH / 2;
     const cy = GAME.HEIGHT / 2;
 
+    addBackgroundShade(this, -3);
     this.createDemoBall();
 
     // 全画面タップゾーン（SOUND TEST ボタン以外の領域がここで受け付けられる）
@@ -20,13 +23,15 @@ export class TitleScene extends Phaser.Scene {
       .setDepth(-2);
 
     this.add.text(cx, cy - 240, 'DROPPING', {
+      fontFamily: FONT_FAMILY,
       fontSize: '110px',
       color: '#aaaaff',
-      fontStyle: 'bold',
+      fontStyle: '800',
     }).setOrigin(0.5);
 
     const highScore = Number(localStorage.getItem(STORAGE_KEYS.HIGH_SCORE) ?? 0);
     this.add.text(cx, cy - 20, `BEST  ${highScore}`, {
+      fontFamily: FONT_FAMILY,
       fontSize: '48px',
       color: '#ffeb70',
     }).setOrigin(0.5);
@@ -40,6 +45,7 @@ export class TitleScene extends Phaser.Scene {
     */
 
     const tapBtn = this.add.text(cx, cy + 240, 'TAP TO START', {
+      fontFamily: FONT_FAMILY,
       fontSize: '56px',
       color: '#ffffff',
       fontStyle: 'bold',

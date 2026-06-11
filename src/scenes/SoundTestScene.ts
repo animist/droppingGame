@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import { GAME } from '../config/balance';
+import { FONT_FAMILY } from '../config/ui';
 import {
   unlockAudio,
   playGameOver,
@@ -24,12 +25,14 @@ export class SoundTestScene extends Phaser.Scene {
     this.cameras.main.setBackgroundColor(0x1a1a2e);
 
     this.add.text(cx, 90, 'SOUND TEST', {
+      fontFamily: FONT_FAMILY,
       fontSize: '64px',
       color: '#ffffff',
       fontStyle: 'bold',
     }).setOrigin(0.5);
 
     this.add.text(cx, 170, 'GAME OVER 候補', {
+      fontFamily: FONT_FAMILY,
       fontSize: '32px',
       color: '#aaaaff',
     }).setOrigin(0.5);
@@ -47,6 +50,7 @@ export class SoundTestScene extends Phaser.Scene {
     let y = 290;
     for (const c of candidates) {
       const btn = this.add.text(cx, y, c.label, {
+        fontFamily: FONT_FAMILY,
         fontSize: '40px',
         color: '#ffffff',
         backgroundColor: '#2a2a4a',
@@ -71,6 +75,7 @@ export class SoundTestScene extends Phaser.Scene {
     }
 
     const backBtn = this.add.text(cx, GAME.HEIGHT - 100, '← TITLE に戻る', {
+      fontFamily: FONT_FAMILY,
       fontSize: '36px',
       color: '#cccccc',
       backgroundColor: '#3a3a4a',
