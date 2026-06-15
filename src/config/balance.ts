@@ -58,6 +58,20 @@ export const GAME = {
   TILT_DEAD_ZONE_DEG: 5,               // この角度未満の傾きは無視（手ブレ対策）
   MAX_VELOCITY: 2000,                  // ボールの最大速度（px/s、横縦両方）
 
+  // --- 傾きインジケーター（水準器スタイル）。傾き入力の状態を可視化する ---
+  TILT_IND_X: 360,                     // 中心X（画面中央）
+  TILT_IND_Y: 1200,                    // 中心Y（ライン列 y1080 の下、下端の空きスペース）
+  TILT_IND_WIDTH: 320,                 // トラックの横幅（px）
+  TILT_IND_HEIGHT: 22,                 // トラックの高さ（px）
+  TILT_IND_BUBBLE_RADIUS: 9,           // 泡（現在の傾きを示すドット）の半径
+  TILT_IND_BUBBLE_ACTIVE_SCALE: 1.5,   // デッドゾーン外（効いている時）の泡の拡大率
+  TILT_IND_MAX_DEG: 25,                // この傾き角で泡が端まで振れる（これ以上は端で頭打ち）
+  TILT_IND_ALPHA: 0.5,                 // インジケーター全体の不透明度（控えめ）
+  TILT_IND_TRACK_COLOR: 0x20203a,      // トラック地色
+  TILT_IND_DEADZONE_COLOR: 0x3a3a5c,   // 中央デッドゾーン帯の色（無入力の安全帯）
+  TILT_IND_BUBBLE_NEUTRAL: 0x8888aa,   // 泡: デッドゾーン内（入力が効いていない）
+  TILT_IND_BUBBLE_ACTIVE: 0x70d6ff,    // 泡: デッドゾーン外（横方向の力が効いている）
+
   // --- スクロール演出（隙間通過時） ---
   SCROLL_DURATION: 400,                // 古い線が上に消えていく時間（ms）
   LINE_ENTER_DURATION_MS: 320,         // 新しい線が下から登場する時間（ms）

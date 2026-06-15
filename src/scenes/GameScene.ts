@@ -8,6 +8,7 @@ import { vibrate } from '../input/haptics';
 import { lerpColor, brighten } from '../util/color';
 import { addBackgroundShade, addWarningVignette } from '../util/bgShade';
 import { getQuality } from '../config/quality';
+import { enableWakeLock, disableWakeLock } from '../util/wakelock';
 
 export class GameScene extends Phaser.Scene {
   private ball!: Phaser.GameObjects.Arc;
@@ -76,6 +77,10 @@ export class GameScene extends Phaser.Scene {
   private ambToX = 0;
   private ambToY = 0;
   private deathColor = 0xffffff;
+  // 傾きインジケーター（水準器）。tilt 入力の状態を可視化
+  private tiltIndicator: Phaser.GameObjects.Container | null = null;
+  private tiltBubble: Phaser.GameObjects.Arc | null = null;
+  private tiltHalfTravel = 0; // 泡が中央から端まで動ける距離(px)
 
   private static readonly PARTICLE_TEXTURE = 'particleDot';
   private static readonly PARTICLE_TEX_RADIUS = 16; // 焼く円テクスチャの半径(px)。実表示はscaleで縮小
@@ -154,6 +159,10 @@ export class GameScene extends Phaser.Scene {
     this.randomizeGapCenter();
     this.createLines();
     this.updateBallColor(); // 初期の穴比率に応じた色を反映
+    this.createTiltIndicator();
+    // 傾き操作中はタッチが無く OS にスリープされやすいので画面スリープを抑止
+    // （タイトルのタップで遷移してきた直後＝ユーザー操作の有効期間内に要求）
+    enableWakeLock();
 
     // BGM 開始（前回の警告こもりが残らないようフィルタを開いておく）
     this.musicIntensity = 0;
@@ -367,6 +376,47 @@ export class GameScene extends Phaser.Scene {
   // glow 強度(旧 outerStrength 相当)→加算スプライトの alpha。最大16で飽和。
   private glowAlpha(strength: number): number {
     return Math.max(0, Math.min(1, strength / 16));
+  }
+
+  // 傾き入力の状態を見せる水準器。中央に無入力の安全帯(デッドゾーン)、泡が現在の傾きを示す。
+  private createTiltIndicator() {
+    const w = GAME.TILT_IND_WIDTH;
+    const h = GAME.TILT_IND_HEIGHT;
+    // 泡が動ける片側距離（トラック内に収める）
+    this.tiltHalfTravel = w / 2 - GAME.TILT_IND_BUBBLE_RADIUS - 6;
+    const dzHalfPx = (GAME.TILT_DEAD_ZONE_DEG / GAME.TILT_IND_MAX_DEG) * this.tiltHalfTravel;
+
+    const track = this.add.rectangle(0, 0, w, h, GAME.TILT_IND_TRACK_COLOR, 0.9);
+    const deadZone = this.add.rectangle(0, 0, dzHalfPx * 2, h - 6, GAME.TILT_IND_DEADZONE_COLOR, 0.9);
+    const neutralTick = this.add.rectangle(0, 0, 2, h, 0xffffff, 0.5); // 中立(キャリブ基準)目盛り
+    this.tiltBubble = this.add.circle(0, 0, GAME.TILT_IND_BUBBLE_RADIUS, GAME.TILT_IND_BUBBLE_NEUTRAL);
+
+    this.tiltIndicator = this.add
+      .container(GAME.TILT_IND_X, GAME.TILT_IND_Y, [track, deadZone, neutralTick, this.tiltBubble])
+      .setDepth(970)
+      .setAlpha(GAME.TILT_IND_ALPHA)
+      .setVisible(tilt.enabled); // 傾き操作が有効な時だけ表示（スワイプ運用時は隠す）
+  }
+
+  // 泡の位置と色を現在の傾き(中立からのズレ)に合わせて更新する。
+  private updateTiltIndicator() {
+    const ind = this.tiltIndicator;
+    if (!ind || !this.tiltBubble) return;
+    const active = tilt.enabled && this.gammaCalibrated;
+    if (ind.visible !== active) ind.setVisible(active);
+    if (!active) return;
+
+    const tiltX = tilt.value - this.gammaRest;
+    const norm = Phaser.Math.Clamp(tiltX / GAME.TILT_IND_MAX_DEG, -1, 1);
+    this.tiltBubble.x = norm * this.tiltHalfTravel;
+    // デッドゾーン内＝無入力(グレー)、外＝力が効いている(シアン＋拡大)
+    const inDeadZone = Math.abs(tiltX) < GAME.TILT_DEAD_ZONE_DEG;
+    this.tiltBubble.setFillStyle(
+      inDeadZone ? GAME.TILT_IND_BUBBLE_NEUTRAL : GAME.TILT_IND_BUBBLE_ACTIVE,
+    );
+    // 状態に応じた目標スケールへ毎フレーム補間（snapせず滑らかに膨らむ）
+    const targetScale = inDeadZone ? 1 : GAME.TILT_IND_BUBBLE_ACTIVE_SCALE;
+    this.tiltBubble.scale += (targetScale - this.tiltBubble.scale) * 0.25;
   }
 
   private createLines() {
@@ -602,6 +652,8 @@ export class GameScene extends Phaser.Scene {
     // ハイライト・グローはスクロール復帰tween中もボールに追従させる
     this.syncBallHighlight();
     this.syncBallGlow();
+    // 傾きインジケーターは常時更新（スクロール中も現在の傾きを反映）
+    this.updateTiltIndicator();
 
     // グロー強度を sin で揺らがせて「呼吸する発光」にする（強度→alpha にマップ）
     if (this.ballGlow) {
@@ -1335,6 +1387,9 @@ export class GameScene extends Phaser.Scene {
   private triggerGameOver() {
     if (this.isGameOver) return;
     this.isGameOver = true;
+
+    // ゲームオーバーで操作は終了するのでスリープ抑止を解除（プレイ中のみ抑止）
+    disableWakeLock();
 
     // タイムダイレーションが残っていたら通常速度へ戻す
     this.time.timeScale = 1;
