@@ -43,10 +43,16 @@ export class GameScene extends Phaser.Scene {
   private bestBeaten = false;        // ベスト超え演出を発動済みか
   private gammaRest = 0;        // 持ち方の傾き癖を吸収するための中立値
   private gammaCalibrated = false;
-  private ballGlow: Phaser.FX.Glow | null = null;
+  // グローは全画面 postFX ではなく、焼いた放射グラデを加算ブレンドした Image で表現する
+  // （postFX は全画面パスでフィルレートを最も食うため）。strength は alpha にマップ。
+  private ballGlow: Phaser.GameObjects.Image | null = null;
   private ballGlowBase = GAME.GLOW_BALL_BASE;  // 色の進行度で決まるグロー基準強度（揺らぎ前）
-  private lineGlows: Phaser.FX.Glow[] = [];
-  private parallaxDots: { obj: Phaser.GameObjects.Arc; speed: number; ratio: number }[] = [];
+  private lineGlows: Phaser.GameObjects.Image[] = [];   // 呼吸パルス用（ライン+マーカー）
+  private leftLineGlow!: Phaser.GameObjects.Image;
+  private rightLineGlow!: Phaser.GameObjects.Image;
+  private leftMarkerGlow!: Phaser.GameObjects.Image;
+  private rightMarkerGlow!: Phaser.GameObjects.Image;
+  private parallaxDots: { obj: Phaser.GameObjects.Image; speed: number; ratio: number }[] = [];
   private musicIntensity = 0;
   private scrollProxy = { y: 0 };       // ライン上昇に同期する仮想スクロール位置
   private scrollPrevY = 0;
@@ -59,6 +65,22 @@ export class GameScene extends Phaser.Scene {
   private nmPivotX = 0;
   private nmPivotY = 0;
   private nmText: Phaser.GameObjects.Text | null = null;
+  // パーティクルは GameObject の生成/破棄を避けるため ParticleEmitter で使い回す
+  private burstEmitter!: Phaser.GameObjects.Particles.ParticleEmitter;   // 通過時の放射バースト
+  private bounceEmitter!: Phaser.GameObjects.Particles.ParticleEmitter;  // バウンス時の上向きバースト
+  private trailEmitter!: Phaser.GameObjects.Particles.ParticleEmitter;   // ボールの残像トレイル
+  private ambientEmitter!: Phaser.GameObjects.Particles.ParticleEmitter; // 落下中の常時きらめき
+  private deathEmitter!: Phaser.GameObjects.Particles.ParticleEmitter;   // 死亡時のボール破裂
+  // ↓ emitParticleAt 直前にセットして onEmit から読む、粒ごとの可変パラメータ
+  private ambTint = 0xffffff;
+  private ambToX = 0;
+  private ambToY = 0;
+  private deathColor = 0xffffff;
+
+  private static readonly PARTICLE_TEXTURE = 'particleDot';
+  private static readonly PARTICLE_TEX_RADIUS = 16; // 焼く円テクスチャの半径(px)。実表示はscaleで縮小
+  private static readonly GLOW_TEXTURE = 'glowSoft';
+  private static readonly GLOW_TEX_RADIUS = 64;     // 放射グラデの半径(px)。実表示はscaleで拡縮
 
   constructor() {
     super('Game');
@@ -113,6 +135,7 @@ export class GameScene extends Phaser.Scene {
     });
     this.cameras.main.setBackgroundColor(GAME.BG_COLOR_START);
 
+    this.createParticles(); // 円テクスチャの生成を含むので先に呼ぶ（パララックスが使う）
     this.createParallax();
     // パララックス(-10)の手前・ゲームプレイ要素の奥に敷き、ドットごと薄く沈めて奥行きを出す
     addBackgroundShade(this, -9);
@@ -201,13 +224,13 @@ export class GameScene extends Phaser.Scene {
     body.setMaxVelocity(GAME.MAX_VELOCITY, GAME.MAX_VELOCITY);
     body.onWorldBounds = true;
     this.physics.world.on('worldbounds', this.onWallBounce, this);
-    this.ballGlow = this.addGlow(
-      this.ball,
-      GAME.GLOW_BALL_BASE,
+    // ボールの下に敷く加算グロー（postFXパスの代替）。位置/大きさ/色/alphaは毎フレーム追従。
+    this.ballGlow = this.makeGlowSprite(
       brighten(GAME.BALL_COLOR_START, GAME.GLOW_BALL_BRIGHTEN),
-      GAME.GLOW_BALL_DISTANCE,
-      GAME.GLOW_BALL_QUALITY,
+      -0.5, // ボール(0)とトレイル(-1)の間
     );
+    if (this.ballGlow) this.ballGlow.setAlpha(this.glowAlpha(GAME.GLOW_BALL_BASE));
+    this.syncBallGlow();
     // 左上の白ハイライト（ボール直後に生成して常にボールの上へ重ねる）。位置・大きさは update で追従
     this.ballHighlight = this.add.circle(
       this.ball.x - radius * 0.35, this.ball.y - radius * 0.35,
@@ -228,6 +251,17 @@ export class GameScene extends Phaser.Scene {
     this.ballHighlight.setRadius(Math.max(2, r * 0.28));
     this.ballHighlight.setRotation(this.ball.rotation);
     this.ballHighlight.setScale(this.ball.scaleX, this.ball.scaleY);
+  }
+
+  // グロースプライトをボールの現在位置・大きさへ追従させる（色とalphaは別途 updateBallColor/update で）
+  private syncBallGlow() {
+    if (!this.ballGlow) return;
+    const r = this.ballDiameter / 2;
+    const meanScale = (this.ball.scaleX + this.ball.scaleY) / 2;
+    // 視覚半径 ≈ ボール半径 + 拡散距離。テクスチャ半径基準でスケール化
+    const radius = r * meanScale + GAME.GLOW_BALL_DISTANCE;
+    this.ballGlow.setPosition(this.ball.x, this.ball.y);
+    this.ballGlow.setScale(radius / GameScene.GLOW_TEX_RADIUS);
   }
 
   // 移動速度に応じてボールを進行方向に伸ばす（速いほど細長く）。
@@ -252,8 +286,12 @@ export class GameScene extends Phaser.Scene {
 
   // 背景の3層パララックス（奥行き感のあるドット群）
   // ratio: ライン上昇スクロールに連動する際の追従率（近景=1.0でライン速度に一致、遠景ほど小さく＝視差）
+  // 個別 Arc(=ドローコール多数) ではなく、焼いた円テクスチャの Image(tint/scale) を使い
+  // 同一テクスチャで WebGL バッチ描画に載せる。
   private createParallax() {
     this.parallaxDots = [];
+    const R = GameScene.PARTICLE_TEX_RADIUS;
+    const tex = GameScene.PARTICLE_TEXTURE;
     const layers = [
       { count: GAME.PARALLAX_FAR_COUNT, size: 2, alpha: 0.12, speed: 14, color: 0x8888aa, ratio: 0.25 },
       { count: GAME.PARALLAX_MID_COUNT, size: 3, alpha: 0.20, speed: 32, color: 0xaaaacc, ratio: 0.55 },
@@ -261,11 +299,15 @@ export class GameScene extends Phaser.Scene {
     ];
     for (const L of layers) {
       for (let i = 0; i < L.count; i++) {
-        const dot = this.add.circle(
+        const dot = this.add.image(
           Phaser.Math.Between(0, GAME.WIDTH),
           Phaser.Math.Between(0, GAME.HEIGHT),
-          L.size, L.color, L.alpha,
-        ).setDepth(-10);
+          tex,
+        )
+          .setScale(L.size / R) // テクスチャ半径Rの円を size px相当へ縮小
+          .setTint(L.color)
+          .setAlpha(L.alpha)
+          .setDepth(-10);
         this.parallaxDots.push({ obj: dot, speed: L.speed, ratio: L.ratio });
       }
     }
@@ -294,24 +336,37 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  // WebGL の Glow FX を安全に追加（Canvasレンダラーでは無視）。失敗してもゲームは続行。
-  // distance/quality でぼかし具合を調整できる（ボールは大きく柔らかく、ラインはシャープに）
-  private addGlow(
-    obj: Phaser.GameObjects.Shape,
-    strength: number,
-    color?: number,
-    distance = GAME.GLOW_DISTANCE,
-    quality = GAME.GLOW_QUALITY,
-  ): Phaser.FX.Glow | null {
-    // low ティアでは glow を完全に無効化（postFXの全画面パスが最大のボトルネック）
+  // 中心が明るく外周で透明になる放射グラデを1枚焼く。加算ブレンドのグロー素材に使う。
+  private bakeGlowTexture() {
+    const key = GameScene.GLOW_TEXTURE;
+    if (this.textures.exists(key)) return;
+    const size = GameScene.GLOW_TEX_RADIUS * 2;
+    const canvas = this.textures.createCanvas(key, size, size);
+    if (!canvas) return;
+    const ctx = canvas.getContext();
+    const c = size / 2;
+    const grad = ctx.createRadialGradient(c, c, 0, c, c, c);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    canvas.refresh();
+  }
+
+  // 加算ブレンドのグロースプライトを1枚生成（postFXパスの代替）。
+  // low ティアではグロー無しなので null を返す。
+  private makeGlowSprite(color: number, depth: number): Phaser.GameObjects.Image | null {
     if (!getQuality().glow) return null;
-    try {
-      const fx = obj.postFX;
-      if (!fx) return null;
-      return fx.addGlow(color, strength, 0, false, quality, distance);
-    } catch {
-      return null;
-    }
+    return this.add.image(0, 0, GameScene.GLOW_TEXTURE)
+      .setBlendMode(Phaser.BlendModes.ADD)
+      .setTint(color)
+      .setDepth(depth);
+  }
+
+  // glow 強度(旧 outerStrength 相当)→加算スプライトの alpha。最大16で飽和。
+  private glowAlpha(strength: number): number {
+    return Math.max(0, Math.min(1, strength / 16));
   }
 
   private createLines() {
@@ -342,19 +397,49 @@ export class GameScene extends Phaser.Scene {
       this.gapCenterX + gapHalf, y, GAME.GAP_MARKER_RADIUS, GAME.GAP_MARKER_COLOR,
     );
 
-    // 新ラインのグロー参照を保持（呼吸アニメ用、古い参照は破棄）
+    // ライン/マーカーの加算グロー（postFXパスの代替）。位置・大きさは oscillateLines で追従、
+    // alpha 呼吸は update で lineGlows をまとめて更新。色は旧 Glow 既定に合わせ白。
     this.lineGlows = [];
-    const gl = this.addGlow(this.leftLine, GAME.GLOW_LINE);
-    const gr = this.addGlow(this.rightLine, GAME.GLOW_LINE);
-    const gml = this.addGlow(this.leftMarker, GAME.GLOW_LINE);
-    const gmr = this.addGlow(this.rightMarker, GAME.GLOW_LINE);
-    if (gl) this.lineGlows.push(gl);
-    if (gr) this.lineGlows.push(gr);
-    if (gml) this.lineGlows.push(gml);
-    if (gmr) this.lineGlows.push(gmr);
+    const a0 = this.glowAlpha(GAME.GLOW_LINE);
+    const ll = this.makeGlowSprite(0xffffff, -0.5);
+    const rl = this.makeGlowSprite(0xffffff, -0.5);
+    const lm = this.makeGlowSprite(0xffffff, -0.5);
+    const rm = this.makeGlowSprite(0xffffff, -0.5);
+    // 非nullなら参照保持＋初期alpha＋初期同期。null(lowティア)時は never 代入を避ける
+    if (ll) { this.leftLineGlow = ll.setAlpha(a0); this.lineGlows.push(ll); }
+    if (rl) { this.rightLineGlow = rl.setAlpha(a0); this.lineGlows.push(rl); }
+    if (lm) { this.leftMarkerGlow = lm.setAlpha(a0); this.lineGlows.push(lm); }
+    if (rm) { this.rightMarkerGlow = rm.setAlpha(a0); this.lineGlows.push(rm); }
+    this.syncLineGlows();
 
     this.physics.add.collider(this.ball, this.leftLine, () => this.onBounce());
     this.physics.add.collider(this.ball, this.rightLine, () => this.onBounce());
+  }
+
+  // ライン/マーカーのグロースプライトを各オーナーの現在の位置・大きさへ合わせる。
+  private syncLineGlows() {
+    const D = GameScene.GLOW_TEX_RADIUS * 2; // テクスチャ径
+    if (this.leftLineGlow && this.leftLine) {
+      this.leftLineGlow.setPosition(this.leftLine.x, this.leftLine.y);
+      this.leftLineGlow.setScale(
+        (this.leftLine.width + GAME.GLOW_DISTANCE * 2) / D,
+        (GAME.LINE_HEIGHT + GAME.GLOW_DISTANCE * 2) / D,
+      );
+    }
+    if (this.rightLineGlow && this.rightLine) {
+      this.rightLineGlow.setPosition(this.rightLine.x, this.rightLine.y);
+      this.rightLineGlow.setScale(
+        (this.rightLine.width + GAME.GLOW_DISTANCE * 2) / D,
+        (GAME.LINE_HEIGHT + GAME.GLOW_DISTANCE * 2) / D,
+      );
+    }
+    const mScale = (GAME.GAP_MARKER_RADIUS * 2 + GAME.GLOW_DISTANCE * 2) / D;
+    if (this.leftMarkerGlow && this.leftMarker) {
+      this.leftMarkerGlow.setPosition(this.leftMarker.x, this.leftMarker.y).setScale(mScale);
+    }
+    if (this.rightMarkerGlow && this.rightMarker) {
+      this.rightMarkerGlow.setPosition(this.rightMarker.x, this.rightMarker.y).setScale(mScale);
+    }
   }
 
   private oscillateLines(time: number) {
@@ -377,6 +462,9 @@ export class GameScene extends Phaser.Scene {
     // 端マーカーをラインの内側端に追従させる（yは登場アニメ中のライン位置に合わせる）
     this.leftMarker?.setPosition(newLeft, this.leftLine.y);
     this.rightMarker?.setPosition(GAME.WIDTH - newRight, this.rightLine.y);
+
+    // グロースプライトもライン/マーカーに追従
+    this.syncLineGlows();
 
     (this.leftLine.body as Phaser.Physics.Arcade.StaticBody | null)?.updateFromGameObject();
     (this.rightLine.body as Phaser.Physics.Arcade.StaticBody | null)?.updateFromGameObject();
@@ -511,19 +599,21 @@ export class GameScene extends Phaser.Scene {
     // パララックスは演出なので常に更新（スクロール中・ゲームオーバー後も動かす）
     this.updateParallax(delta);
 
-    // ハイライトはスクロール復帰tween中もボールに追従させる
+    // ハイライト・グローはスクロール復帰tween中もボールに追従させる
     this.syncBallHighlight();
+    this.syncBallGlow();
 
-    // グロー強度を sin で揺らがせて「呼吸する発光」にする
+    // グロー強度を sin で揺らがせて「呼吸する発光」にする（強度→alpha にマップ）
     if (this.ballGlow) {
       const pulse = Math.sin(_time * 0.001 * GAME.GLOW_PULSE_FREQ) * GAME.GLOW_PULSE_AMP;
-      this.ballGlow.outerStrength = Math.max(0, this.ballGlowBase + pulse);
+      this.ballGlow.setAlpha(this.glowAlpha(this.ballGlowBase + pulse));
     }
     // ラインはより遅く・小さく呼吸（基準より控えめでゼロにはならない）
     if (this.lineGlows.length) {
       const linePulse = Math.sin(_time * 0.001 * GAME.GLOW_LINE_PULSE_FREQ) * GAME.GLOW_LINE_PULSE_AMP;
+      const a = this.glowAlpha(GAME.GLOW_LINE + linePulse);
       for (const g of this.lineGlows) {
-        g.outerStrength = GAME.GLOW_LINE + linePulse;
+        g.setAlpha(a);
       }
     }
 
@@ -679,9 +769,13 @@ export class GameScene extends Phaser.Scene {
     const oldRight = this.rightLine;
     const oldMarkerL = this.leftMarker;
     const oldMarkerR = this.rightMarker;
+    // グロースプライト（lowティアでは未生成→undefined を除外）。ラインと一緒に流して破棄
+    const oldGlows = [
+      this.leftLineGlow, this.rightLineGlow, this.leftMarkerGlow, this.rightMarkerGlow,
+    ].filter(Boolean);
 
     this.tweens.add({
-      targets: [oldLeft, oldRight, oldMarkerL, oldMarkerR],
+      targets: [oldLeft, oldRight, oldMarkerL, oldMarkerR, ...oldGlows],
       y: -GAME.LINE_HEIGHT,
       duration: GAME.SCROLL_DURATION,
       ease: 'Cubic.easeIn',
@@ -690,6 +784,7 @@ export class GameScene extends Phaser.Scene {
         oldRight.destroy();
         oldMarkerL.destroy();
         oldMarkerR.destroy();
+        oldGlows.forEach((g) => g.destroy());
       },
     });
 
@@ -730,12 +825,18 @@ export class GameScene extends Phaser.Scene {
         this.randomizeGapCenter();
         this.createLines();
 
-        this.leftLine.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
-        this.rightLine.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
-        this.leftMarker.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
-        this.rightMarker.y = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
+        const enterY = GAME.HEIGHT + GAME.LINE_ENTER_OFFSET_PX;
+        this.leftLine.y = enterY;
+        this.rightLine.y = enterY;
+        this.leftMarker.y = enterY;
+        this.rightMarker.y = enterY;
+        // 新グローも登場位置へ寄せて一緒に登場させる（lowティアでは undefined 除外）
+        const newGlows = [
+          this.leftLineGlow, this.rightLineGlow, this.leftMarkerGlow, this.rightMarkerGlow,
+        ].filter(Boolean);
+        newGlows.forEach((g) => { g.y = enterY; });
         this.tweens.add({
-          targets: [this.leftLine, this.rightLine, this.leftMarker, this.rightMarker],
+          targets: [this.leftLine, this.rightLine, this.leftMarker, this.rightMarker, ...newGlows],
           y: GAME.LINE_Y,
           duration: GAME.LINE_ENTER_DURATION_MS,
           ease: 'Back.easeOut',
@@ -795,38 +896,19 @@ export class GameScene extends Phaser.Scene {
       const px = this.ball.x + Math.cos(ang) * r * 0.8;
       const py = this.ball.y + Math.sin(ang) * r * 0.8;
       const gold = this.perfectStreak > 0 && Math.random() < GAME.AMBIENT_GOLD_RATIO;
-      const color = gold ? 0xffd700 : this.ball.fillColor;
-      const size = Phaser.Math.Between(GAME.AMBIENT_SIZE_MIN, GAME.AMBIENT_SIZE_MAX);
-      const p = this.add.circle(px, py, size, color, 0.85).setDepth(this.ball.depth - 1);
+      // emitParticleAt は同期実行なので、直前にセットした値を onEmit が粒ごとに読む
+      this.ambTint = gold ? 0xffd700 : this.ball.fillColor;
       const driftX = (Math.random() - 0.5) * GAME.AMBIENT_DRIFT_PX - body.velocity.x * 0.04;
       const driftY = (Math.random() - 0.5) * GAME.AMBIENT_DRIFT_PX - body.velocity.y * 0.06;
-      this.tweens.add({
-        targets: p,
-        x: px + driftX,
-        y: py + driftY,
-        alpha: 0,
-        scale: 0.2,
-        duration: GAME.AMBIENT_DURATION_MS,
-        ease: 'Quad.easeOut',
-        onComplete: () => p.destroy(),
-      });
+      this.ambToX = px + driftX;
+      this.ambToY = py + driftY;
+      this.ambientEmitter.emitParticleAt(px, py);
     }
   }
 
   private spawnTrailDot() {
-    const radius = this.ballDiameter / 2;
-    const dot = this.add.circle(
-      this.ball.x, this.ball.y, radius,
-      this.ball.fillColor, GAME.TRAIL_ALPHA,
-    ).setDepth(this.ball.depth - 1);
-    this.tweens.add({
-      targets: dot,
-      alpha: 0,
-      scale: 0.3,
-      duration: GAME.TRAIL_DURATION_MS,
-      ease: 'Quad.easeOut',
-      onComplete: () => dot.destroy(),
-    });
+    // サイズ・色はエミッタの onEmit がボール状態を参照するので位置指定だけでよい
+    this.trailEmitter.emitParticleAt(this.ball.x, this.ball.y);
   }
 
   private checkWarning() {
@@ -906,7 +988,7 @@ export class GameScene extends Phaser.Scene {
     // （実際の強度は update() で sin 揺らぎを乗せる）
     this.ballGlowBase = GAME.GLOW_BALL_BASE + (GAME.GLOW_BALL_MAX - GAME.GLOW_BALL_BASE) * t;
     if (this.ballGlow) {
-      this.ballGlow.color = brighten(c, GAME.GLOW_BALL_BRIGHTEN);
+      this.ballGlow.setTint(brighten(c, GAME.GLOW_BALL_BRIGHTEN));
     }
   }
 
@@ -999,6 +1081,11 @@ export class GameScene extends Phaser.Scene {
     this.frozen = true;
     this.physics.world.pause();
     this.tweens.pauseAll();
+    // 飛散中のパーティクルもストップモーションに合わせて凍結
+    this.burstEmitter.pause();
+    this.bounceEmitter.pause();
+    this.trailEmitter.pause();
+    this.ambientEmitter.pause();
   }
 
   // 毎フレーム呼ばれ、ピボットを画面上で固定したままズーム倍率を時間で変化させる
@@ -1046,6 +1133,10 @@ export class GameScene extends Phaser.Scene {
     cam.setScroll(0, 0);
     this.physics.world.resume();
     this.tweens.resumeAll();
+    this.burstEmitter.resume();
+    this.bounceEmitter.resume();
+    this.trailEmitter.resume();
+    this.ambientEmitter.resume();
     if (this.nmText) {
       const text = this.nmText;
       this.nmText = null;
@@ -1160,50 +1251,85 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
+  // 円テクスチャを1枚焼き、3つのエミッタを生成して使い回す。
+  // GameObject(円)の都度生成/破棄と個別Tweenをやめ、バッチ描画＆内部プールに載せる。
+  private createParticles() {
+    const R = GameScene.PARTICLE_TEX_RADIUS;
+    const tex = GameScene.PARTICLE_TEXTURE;
+    if (!this.textures.exists(tex)) {
+      const g = this.make.graphics({ x: 0, y: 0 });
+      g.fillStyle(0xffffff, 1);
+      g.fillCircle(R, R, R);
+      g.generateTexture(tex, R * 2, R * 2);
+      g.destroy();
+    }
+    this.bakeGlowTexture();
+
+    // 通過時の放射バースト（全方位）。色は固定のボールカラー。
+    this.burstEmitter = this.add.particles(0, 0, tex, {
+      lifespan: GAME.PARTICLE_DURATION_MS,
+      speed: { min: GAME.PARTICLE_SPEED_MIN, max: GAME.PARTICLE_SPEED_MAX },
+      angle: { min: 0, max: 360 },
+      scale: { start: 4.5 / R, end: 0.9 / R }, // 半径3〜6px相当→縮小
+      alpha: { start: 1, end: 0 },
+      tint: GAME.BALL_COLOR,
+      emitting: false,
+    }).setDepth(900);
+
+    // バウンス時の上向きバースト。色はその時のボール色に追従。
+    this.bounceEmitter = this.add.particles(0, 0, tex, {
+      lifespan: GAME.BOUNCE_PARTICLE_DURATION_MS,
+      speed: { min: GAME.BOUNCE_PARTICLE_SPEED_MIN, max: GAME.BOUNCE_PARTICLE_SPEED_MAX },
+      angle: { min: -150, max: -30 }, // 真上(-90°)を中心に約±60°の扇
+      scale: { start: 3 / R, end: 0.9 / R },
+      alpha: { start: 0.9, end: 0 },
+      tint: { onEmit: () => this.ball.fillColor },
+      emitting: false,
+    }).setDepth(850);
+
+    // ボールの残像トレイル。サイズと色はボールに追従（速度0でその場フェード）。
+    this.trailEmitter = this.add.particles(0, 0, tex, {
+      lifespan: GAME.TRAIL_DURATION_MS,
+      speed: 0,
+      scale: { onEmit: () => (this.ballDiameter / 2) / R },
+      alpha: { start: GAME.TRAIL_ALPHA, end: 0 },
+      tint: { onEmit: () => this.ball.fillColor },
+      emitting: false,
+    }).setDepth(-1);
+
+    // 落下中の常時きらめき。粒ごとに色(ambTint)と移動先(ambToX/Y)を onEmit で受け取り、
+    // moveTo で寿命をかけて漂わせる（元の per-粒 tween を再現）。
+    this.ambientEmitter = this.add.particles(0, 0, tex, {
+      lifespan: GAME.AMBIENT_DURATION_MS,
+      scale: { start: 3 / R, end: 0.6 / R }, // 半径2〜4px相当→縮小
+      alpha: { start: 0.85, end: 0 },
+      tint: { onEmit: () => this.ambTint },
+      moveToX: { onEmit: () => this.ambToX },
+      moveToY: { onEmit: () => this.ambToY },
+      emitting: false,
+    }).setDepth(-1);
+
+    // 死亡時のボール破裂。放射状＋重力で少し落下感。色はボール色／25%白。
+    this.deathEmitter = this.add.particles(0, 0, tex, {
+      lifespan: GAME.DEATH_PARTICLE_DURATION_MS,
+      speed: { min: GAME.DEATH_PARTICLE_SPEED_MIN * 0.85, max: GAME.DEATH_PARTICLE_SPEED_MAX * 0.85 },
+      angle: { min: 0, max: 360 },
+      gravityY: 250, // 元の「+60px 下方向」を重力で近似
+      scale: { start: 5.5 / R, end: 1.1 / R }, // 半径3〜8px相当→縮小
+      alpha: { start: 1, end: 0 },
+      tint: { onEmit: () => (Math.random() < 0.25 ? 0xffffff : this.deathColor) },
+      emitting: false,
+    }).setDepth(900);
+  }
+
   private emitBounceBurst(x: number, y: number) {
     const n = Math.max(1, Math.round(GAME.BOUNCE_PARTICLE_COUNT * getQuality().particleScale));
-    for (let i = 0; i < n; i++) {
-      const angle = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 0.7;
-      const speed = Phaser.Math.FloatBetween(
-        GAME.BOUNCE_PARTICLE_SPEED_MIN,
-        GAME.BOUNCE_PARTICLE_SPEED_MAX,
-      );
-      const size = Phaser.Math.Between(2, 4);
-      const p = this.add.circle(x, y, size, this.ball.fillColor)
-        .setDepth(850)
-        .setAlpha(0.9);
-      this.tweens.add({
-        targets: p,
-        x: x + Math.cos(angle) * speed * 0.45,
-        y: y + Math.sin(angle) * speed * 0.45,
-        alpha: 0,
-        scale: 0.3,
-        duration: GAME.BOUNCE_PARTICLE_DURATION_MS,
-        ease: 'Quad.easeOut',
-        onComplete: () => p.destroy(),
-      });
-    }
+    this.bounceEmitter.explode(n, x, y);
   }
 
   private emitBurst(x: number, y: number, count: number) {
     const n = Math.max(1, Math.round(count * getQuality().particleScale));
-    for (let i = 0; i < n; i++) {
-      const baseAngle = (i / n) * Math.PI * 2;
-      const angle = baseAngle + (Math.random() - 0.5) * 0.6;
-      const speed = Phaser.Math.FloatBetween(GAME.PARTICLE_SPEED_MIN, GAME.PARTICLE_SPEED_MAX);
-      const size = Phaser.Math.Between(3, 6);
-      const p = this.add.circle(x, y, size, GAME.BALL_COLOR).setDepth(900);
-      this.tweens.add({
-        targets: p,
-        x: x + Math.cos(angle) * speed * 0.7,
-        y: y + Math.sin(angle) * speed * 0.7,
-        alpha: 0,
-        scale: 0.2,
-        duration: GAME.PARTICLE_DURATION_MS,
-        ease: 'Quad.easeOut',
-        onComplete: () => p.destroy(),
-      });
-    }
+    this.burstEmitter.explode(n, x, y);
   }
 
   private triggerGameOver() {
@@ -1218,6 +1344,10 @@ export class GameScene extends Phaser.Scene {
     this.nmActive = false;
     if (this.nmText) { this.nmText.destroy(); this.nmText = null; }
     this.physics.world.resume(); // 万一フリーズ中なら解除
+    this.burstEmitter?.resume();
+    this.bounceEmitter?.resume();
+    this.trailEmitter?.resume();
+    this.ambientEmitter?.resume();
     this.cameras.main.setZoom(1); // ニアミスズームが残っていたら戻す
     this.cameras.main.setScroll(0, 0);
 
@@ -1303,31 +1433,12 @@ export class GameScene extends Phaser.Scene {
   private explodeBall() {
     const x = this.ball.x;
     const y = this.ball.y;
-    const color = this.ball.fillColor;
+    this.deathColor = this.ball.fillColor;
     this.tweens.killTweensOf(this.ball);
     this.ball.setVisible(false);
     this.ballHighlight.setVisible(false);
 
     const n = Math.max(8, Math.round(GAME.DEATH_PARTICLE_COUNT * getQuality().particleScale));
-    for (let i = 0; i < n; i++) {
-      const angle = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.8;
-      const speed = Phaser.Math.FloatBetween(
-        GAME.DEATH_PARTICLE_SPEED_MIN,
-        GAME.DEATH_PARTICLE_SPEED_MAX,
-      );
-      const size = Phaser.Math.Between(3, 8);
-      const c = Math.random() < 0.25 ? 0xffffff : color;
-      const p = this.add.circle(x, y, size, c).setDepth(900);
-      this.tweens.add({
-        targets: p,
-        x: x + Math.cos(angle) * speed * 0.6,
-        y: y + Math.sin(angle) * speed * 0.6 + 60,
-        alpha: 0,
-        scale: 0.2,
-        duration: GAME.DEATH_PARTICLE_DURATION_MS,
-        ease: 'Quad.easeOut',
-        onComplete: () => p.destroy(),
-      });
-    }
+    this.deathEmitter.explode(n, x, y);
   }
 }
