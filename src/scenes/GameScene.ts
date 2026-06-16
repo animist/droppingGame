@@ -18,7 +18,9 @@ export class GameScene extends Phaser.Scene {
   private leftMarker!: Phaser.GameObjects.Arc;     // 隙間の左端を示す発光点
   private rightMarker!: Phaser.GameObjects.Arc;    // 隙間の右端を示す発光点
 
-  private gapWidth = GAME.GAP_INITIAL;
+  private gapBase = GAME.GAP_INITIAL;   // 決定論的な基準隙間幅（単調に縮む。難易度カーブの本体）
+  private gapWidth = GAME.GAP_INITIAL;   // 表示/判定用の実効隙間幅（基準幅±ジッタ）
+  private stageCount = 0;                // 通過したステージ数（息継ぎリズムの判定に使う）
   private gapCenterX = GAME.WIDTH / 2;
   private ballDiameter = GAME.BALL_INITIAL_DIAMETER;
   private score = 0;
@@ -92,7 +94,9 @@ export class GameScene extends Phaser.Scene {
   }
 
   create() {
-    this.gapWidth = GAME.GAP_INITIAL;
+    this.gapBase = GAME.GAP_INITIAL;
+    this.gapWidth = GAME.GAP_INITIAL; // 初回ステージはジッタ無しで素直に開始
+    this.stageCount = 0;
     this.gapCenterX = GAME.WIDTH / 2;
     this.ballDiameter = GAME.BALL_INITIAL_DIAMETER;
     this.score = 0;
@@ -495,7 +499,12 @@ export class GameScene extends Phaser.Scene {
   private oscillateLines(time: number) {
     if (!this.leftLine || !this.rightLine) return;
     const t = time * 0.001;
-    const amp = GAME.LINE_OSCILLATION_AMPLITUDE_PX;
+    // 振幅をマージン(隙間幅-ボール直径)に連動。両ラインが同時に内側へ振れても
+    // 必ず SAFE_MARGIN だけは通せるよう片側振幅を (margin - SAFE)/2 で頭打ちにする。
+    // → 余裕のある序盤は最大振幅まで脈動、ギリギリの終盤は自動でほぼ静止（公平性担保）。
+    const margin = this.gapWidth - this.ballDiameter;
+    const maxOsc = Math.max(0, (margin - GAME.LINE_OSC_SAFE_MARGIN_PX) / 2);
+    const amp = Math.min(GAME.LINE_OSCILLATION_AMPLITUDE_PX, maxOsc);
     const leftOsc = Math.sin(t * GAME.LINE_OSC_FREQ_LEFT) * amp;
     const rightOsc = Math.sin(t * GAME.LINE_OSC_FREQ_RIGHT + GAME.LINE_OSC_PHASE_RIGHT) * amp;
 
@@ -522,9 +531,34 @@ export class GameScene extends Phaser.Scene {
 
   private randomizeGapCenter() {
     const gapHalf = this.gapWidth / 2;
-    const min = gapHalf + GAME.LINE_SEGMENT_MIN_WIDTH;
-    const max = GAME.WIDTH - gapHalf - GAME.LINE_SEGMENT_MIN_WIDTH;
-    this.gapCenterX = Phaser.Math.Between(Math.ceil(min), Math.floor(max));
+    const min = Math.ceil(gapHalf + GAME.LINE_SEGMENT_MIN_WIDTH);
+    const max = Math.floor(GAME.WIDTH - gapHalf - GAME.LINE_SEGMENT_MIN_WIDTH);
+    const prev = this.gapCenterX;
+    // 連続ステージで必ず一定距離ずらす（毎回横移動させて操作の幅を出す）。
+    // 数回引き直して満たせなければ最後の候補を採用（範囲が狭い時のフォールバック）。
+    let next = prev;
+    for (let i = 0; i < 8; i++) {
+      next = Phaser.Math.Between(min, max);
+      if (Math.abs(next - prev) >= GAME.GAP_CENTER_MIN_SHIFT_PX) break;
+    }
+    this.gapCenterX = next;
+  }
+
+  // 基準幅(gapBase)に毎ステージのゆらぎを乗せた実効幅を返す。
+  // floor(ボール直径+下限)と GAP_INITIAL でクランプし、通過不能/初期より楽 を防ぐ。
+  // ゆらぎは累積しない（次ステージは gapBase から計算）ので難易度カーブは保たれる。
+  private computeEffectiveGap(): number {
+    const floor = this.ballDiameter + GAME.GAP_MIN_MARGIN;
+    // 息継ぎステージ: 緩和なので±ゆらぎは乗せず、確実に「広い」を保証する
+    const isBreather =
+      GAME.BREATHER_EVERY_N > 0 &&
+      this.stageCount > 0 &&
+      this.stageCount % GAME.BREATHER_EVERY_N === 0;
+    if (isBreather) {
+      return Phaser.Math.Clamp(this.gapBase + GAME.BREATHER_GAP_BONUS_PX, floor, GAME.GAP_INITIAL);
+    }
+    const jitter = Phaser.Math.Between(-GAME.GAP_JITTER_PX, GAME.GAP_JITTER_PX);
+    return Phaser.Math.Clamp(this.gapBase + jitter, floor, GAME.GAP_INITIAL);
   }
 
   private onBounce() {
@@ -861,10 +895,13 @@ export class GameScene extends Phaser.Scene {
       duration: GAME.SCROLL_DURATION,
       ease: 'Cubic.easeOut',
       onComplete: () => {
-        this.gapWidth = Math.max(
+        this.stageCount += 1;
+        // 基準幅を単調に縮め（難易度カーブ本体）、実効幅はそこに非累積ジッタ/息継ぎを乗せる
+        this.gapBase = Math.max(
           this.ballDiameter + GAME.GAP_MIN_MARGIN,
-          this.gapWidth - GAME.GAP_REDUCTION,
+          this.gapBase - GAME.GAP_REDUCTION,
         );
+        this.gapWidth = this.computeEffectiveGap();
         this.updateBgColor();
         this.updateBallColor(); // 穴が縮んで比率が変わったのでボール色も更新
 
@@ -1025,9 +1062,11 @@ export class GameScene extends Phaser.Scene {
     setMusicMuffled(false);
   }
 
-  // ボール色の進行度 t (0=開始色、1=終端色)。「ボール直径 / 穴幅」の比率で決まる
+  // ボール色の進行度 t (0=開始色、1=終端色)。「ボール直径 / 基準穴幅」の比率で決まる。
+  // 実効幅(gapWidth)ではなく決定論的な gapBase を使うことで、息継ぎ/ジッタの一時的な
+  // 幅変化で色が往復せず、難易度カーブに沿って滑らかに進行する。
   private ballColorT(): number {
-    const ratio = this.ballDiameter / this.gapWidth;
+    const ratio = this.ballDiameter / this.gapBase;
     const t = (ratio - GAME.BALL_COLOR_RATIO_START) / (GAME.BALL_COLOR_RATIO_END - GAME.BALL_COLOR_RATIO_START);
     return Math.max(0, Math.min(1, t));
   }
@@ -1045,7 +1084,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateBgColor() {
-    const ratio = this.gapWidth / this.ballDiameter;
+    // ボール色と同様、実効幅ではなく基準幅(gapBase)基準。息継ぎ/ジッタで背景が往復しない。
+    const ratio = this.gapBase / this.ballDiameter;
     const targetT = this.bgProgressFromRatio(ratio);
     const proxy = { t: this.bgProgress };
     this.tweens.add({
