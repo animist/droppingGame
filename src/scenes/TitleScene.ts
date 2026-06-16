@@ -17,10 +17,8 @@ export class TitleScene extends Phaser.Scene {
     addBackgroundShade(this, -3);
     this.createDemoBall();
 
-    // 全画面タップゾーン（SOUND TEST ボタン以外の領域がここで受け付けられる）
-    const bgZone = this.add.rectangle(cx, cy, GAME.WIDTH, GAME.HEIGHT)
-      .setInteractive()
-      .setDepth(-2);
+    // 背景。タップ受付は canvas のネイティブリスナー側で行う（iOS許可要求のジェスチャ維持のため）
+    this.add.rectangle(cx, cy, GAME.WIDTH, GAME.HEIGHT).setDepth(-2);
 
     this.add.text(cx, cy - 240, 'DROPPING', {
       fontFamily: FONT_FAMILY,
@@ -59,11 +57,30 @@ export class TitleScene extends Phaser.Scene {
       repeat: -1,
     });
 
-    bgZone.on('pointerdown', () => {
+    // iOS の DeviceOrientationEvent.requestPermission() は「タップのネイティブ
+    // イベントハンドラ内で同期的に呼ぶ」ことが必須。Phaser の pointer イベントは
+    // 次フレームで処理されジェスチャ文脈(transient activation)が外れて拒否される
+    // ため、canvas に直接ネイティブリスナーを張って enableTilt() を同期呼び出しする。
+    const canvas = this.game.canvas;
+    let started = false;
+    const onTap = () => {
+      if (started) return;
+      started = true;
+      canvas.removeEventListener('pointerup', onTap);
+      canvas.removeEventListener('touchend', onTap);
       unlockAudio();
+      // ここは必ずネイティブイベントのコールスタック内なので許可ダイアログが出る
       enableTilt().finally(() => {
         this.scene.start('Game');
       });
+    };
+    // pointerup と touchend の両方を張り、最初の発火でどちらも解除して二重起動を防ぐ
+    canvas.addEventListener('pointerup', onTap);
+    canvas.addEventListener('touchend', onTap);
+    // タップ前にシーンが終了した場合のリスナー後始末
+    this.events.once('shutdown', () => {
+      canvas.removeEventListener('pointerup', onTap);
+      canvas.removeEventListener('touchend', onTap);
     });
   }
 
