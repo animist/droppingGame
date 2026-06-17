@@ -21,6 +21,7 @@ export class GameScene extends Phaser.Scene {
   private gapBase = GAME.GAP_INITIAL;   // 決定論的な基準隙間幅（単調に縮む。難易度カーブの本体）
   private gapWidth = GAME.GAP_INITIAL;   // 表示/判定用の実効隙間幅（基準幅±ジッタ）
   private stageCount = 0;                // 通過したステージ数（息継ぎリズムの判定に使う）
+  private isBreather = false;            // 現在のステージが「広い息継ぎ」か（ライン色の合図に使う）
   private gapCenterX = GAME.WIDTH / 2;
   private ballDiameter = GAME.BALL_INITIAL_DIAMETER;
   private score = 0;
@@ -97,6 +98,7 @@ export class GameScene extends Phaser.Scene {
     this.gapBase = GAME.GAP_INITIAL;
     this.gapWidth = GAME.GAP_INITIAL; // 初回ステージはジッタ無しで素直に開始
     this.stageCount = 0;
+    this.isBreather = false;
     this.gapCenterX = GAME.WIDTH / 2;
     this.ballDiameter = GAME.BALL_INITIAL_DIAMETER;
     this.score = 0;
@@ -429,26 +431,28 @@ export class GameScene extends Phaser.Scene {
     const rightSegWidth = GAME.WIDTH - (this.gapCenterX + gapHalf);
     const y = GAME.LINE_Y;
 
+    const lineColor = this.lineBaseColor();
     this.leftLine = this.add.rectangle(
       leftSegWidth / 2, y,
       leftSegWidth, GAME.LINE_HEIGHT,
-      GAME.LINE_COLOR,
+      lineColor,
     );
     this.rightLine = this.add.rectangle(
       this.gapCenterX + gapHalf + rightSegWidth / 2, y,
       rightSegWidth, GAME.LINE_HEIGHT,
-      GAME.LINE_COLOR,
+      lineColor,
     );
 
     this.physics.add.existing(this.leftLine, true);
     this.physics.add.existing(this.rightLine, true);
 
     // 隙間の端を示す発光マーカー（端の視認性UP）。位置は oscillateLines で追従
+    const markerColor = this.markerBaseColor();
     this.leftMarker = this.add.circle(
-      leftSegWidth, y, GAME.GAP_MARKER_RADIUS, GAME.GAP_MARKER_COLOR,
+      leftSegWidth, y, GAME.GAP_MARKER_RADIUS, markerColor,
     );
     this.rightMarker = this.add.circle(
-      this.gapCenterX + gapHalf, y, GAME.GAP_MARKER_RADIUS, GAME.GAP_MARKER_COLOR,
+      this.gapCenterX + gapHalf, y, GAME.GAP_MARKER_RADIUS, markerColor,
     );
 
     // ライン/マーカーの加算グロー（postFXパスの代替）。位置・大きさは oscillateLines で追従、
@@ -550,15 +554,27 @@ export class GameScene extends Phaser.Scene {
   private computeEffectiveGap(): number {
     const floor = this.ballDiameter + GAME.GAP_MIN_MARGIN;
     // 息継ぎステージ: 緩和なので±ゆらぎは乗せず、確実に「広い」を保証する
-    const isBreather =
+    this.isBreather =
       GAME.BREATHER_EVERY_N > 0 &&
       this.stageCount > 0 &&
       this.stageCount % GAME.BREATHER_EVERY_N === 0;
-    if (isBreather) {
-      return Phaser.Math.Clamp(this.gapBase + GAME.BREATHER_GAP_BONUS_PX, floor, GAME.GAP_INITIAL);
+    if (this.isBreather) {
+      // 現状の穴サイズ(gapBase)に倍率をかけて緩和。GAP_INITIAL の頭打ちは外し、
+      // 代わりにライン最小長を確保できる幾何学上限でのみクランプ（中心配置が破綻しない範囲）。
+      const maxGap = GAME.WIDTH - 2 * GAME.LINE_SEGMENT_MIN_WIDTH;
+      return Phaser.Math.Clamp(this.gapBase * GAME.BREATHER_GAP_MULT, floor, maxGap);
     }
     const jitter = Phaser.Math.Between(-GAME.GAP_JITTER_PX, GAME.GAP_JITTER_PX);
     return Phaser.Math.Clamp(this.gapBase + jitter, floor, GAME.GAP_INITIAL);
+  }
+
+  // 現在のステージのライン/マーカーの基準色（息継ぎ時は緑＝安全の合図）。
+  // 警告(赤)解除時の復帰色にも使うので一箇所に集約する。
+  private lineBaseColor(): number {
+    return this.isBreather ? GAME.BREATHER_LINE_COLOR : GAME.LINE_COLOR;
+  }
+  private markerBaseColor(): number {
+    return this.isBreather ? GAME.BREATHER_LINE_COLOR : GAME.GAP_MARKER_COLOR;
   }
 
   private onBounce() {
@@ -1046,14 +1062,17 @@ export class GameScene extends Phaser.Scene {
       this.warningTween.stop();
       this.warningTween = null;
     }
+    // 警告解除時は現在ステージの基準色へ戻す（息継ぎ中なら緑、通常なら水色）
+    const lineColor = this.lineBaseColor();
+    const markerColor = this.markerBaseColor();
     this.leftLine?.setAlpha(1);
     this.rightLine?.setAlpha(1);
-    this.leftLine?.setFillStyle(GAME.LINE_COLOR);
-    this.rightLine?.setFillStyle(GAME.LINE_COLOR);
+    this.leftLine?.setFillStyle(lineColor);
+    this.rightLine?.setFillStyle(lineColor);
     this.leftMarker?.setAlpha(1);
     this.rightMarker?.setAlpha(1);
-    this.leftMarker?.setFillStyle(GAME.GAP_MARKER_COLOR);
-    this.rightMarker?.setFillStyle(GAME.GAP_MARKER_COLOR);
+    this.leftMarker?.setFillStyle(markerColor);
+    this.rightMarker?.setFillStyle(markerColor);
     if (this.warnVignetteTween) {
       this.warnVignetteTween.stop();
       this.warnVignetteTween = null;
