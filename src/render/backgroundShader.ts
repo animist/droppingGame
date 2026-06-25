@@ -37,6 +37,10 @@ uniform vec3 ballGlowColor;
 uniform float ballGlowStr;
 uniform vec2 ballVel;
 
+uniform vec4 gap;          // leftEdge, rightEdge, y, alpha(0で非表示)
+uniform vec3 gapColor;     // ライン/マーカー色（通常水色/息継ぎ緑/警告赤）
+uniform float lineGlowStr; // ライングローの強度（呼吸）
+
 varying vec2 fragCoord;
 
 const vec3 COL_START = vec3(0.102, 0.102, 0.180); // 青紫
@@ -62,6 +66,31 @@ float starLayer(vec2 uv, float scale, float speed, float density) {
   float spark = 1.0 - smoothstep(0.0, 0.09, d); // 小さめの点
   float tw = 0.6 + 0.4 * sin(time * (1.0 + h * 2.0) + h * 6.28);
   return spark * on * tw;
+}
+
+// 矩形SDF
+float sdBox(vec2 p, vec2 b) {
+  vec2 d = abs(p) - b;
+  return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+}
+
+// 隙間（左右バー + 端マーカー + グロー）を col に合成。alpha=0 なら描かない。
+void drawGap(inout vec3 col, vec2 P, vec4 g, vec3 c, float glowStr) {
+  float alpha = g.w;
+  if (alpha < 0.001) return;
+  float leftE = g.x;
+  float rightE = g.y;
+  float y = g.z;
+  float W = resolution.x;
+  float hh = 1.5; // LINE_HEIGHT(3)/2
+  float dL = sdBox(P - vec2(leftE * 0.5, y), vec2(leftE * 0.5, hh));
+  float dR = sdBox(P - vec2((rightE + W) * 0.5, y), vec2((W - rightE) * 0.5, hh));
+  float dBar = min(dL, dR);
+  float dM = min(length(P - vec2(leftE, y)), length(P - vec2(rightE, y))) - 7.0; // GAP_MARKER_RADIUS
+  float dLine = min(dBar, dM);
+  col += c * (exp(-max(dLine, 0.0) * 0.06) * glowStr * alpha); // グロー（加算）
+  float m = (1.0 - smoothstep(-1.0, 1.0, dLine)) * alpha;      // 塗り
+  col = mix(col, c, m);
 }
 
 void main(void) {
@@ -90,18 +119,19 @@ void main(void) {
   float br = ball.z;
   float brot = ball.w;
 
-  // モーショントレイル（速度の逆方向へ伸びるカプセル）
+  // モーショントレイル（速度の逆方向へ伸びるカプセル）。classicのゴースト残像に寄せて
+  // 早めに立ち上げ・長く・太く・濃くする。
   float sp = length(ballVel);
-  float trailAmt = 0.30 * smoothstep(150.0, 600.0, sp);
+  float trailAmt = 0.50 * smoothstep(120.0, 480.0, sp);
   if (trailAmt > 0.001) {
     vec2 dir = ballVel / max(sp, 1.0);
     vec2 a = bc;
-    vec2 b = bc - dir * min(sp * 0.12, br * 5.0);
+    vec2 b = bc - dir * min(sp * 0.16, br * 7.0);
     vec2 pa = P - a;
     vec2 ba = b - a;
     float hh = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0), 0.0, 1.0);
-    float dCap = length(pa - ba * hh) - br * 0.6;
-    float cap = (1.0 - smoothstep(-1.0, 6.0, dCap)) * (1.0 - hh);
+    float dCap = length(pa - ba * hh) - br * 0.72;
+    float cap = (1.0 - smoothstep(-1.0, 7.0, dCap)) * (1.0 - hh);
     col += ballColor * cap * trailAmt;
   }
 
@@ -126,6 +156,9 @@ void main(void) {
   float hl = (1.0 - smoothstep(-1.0, 1.0, dh)) * ballMask * 0.45;
   col += vec3(1.0) * hl;
 
+  // ---- ライン/マーカー（ボールの手前に重ねる＝classic相当）----
+  drawGap(col, P, gap, gapColor, lineGlowStr);
+
   gl_FragColor = vec4(col, 1.0);
 }
 `;
@@ -141,12 +174,18 @@ export interface PlayfieldState {
   velX: number; velY: number;
 }
 
+export interface GapState {
+  leftEdge: number; rightEdge: number; y: number; alpha: number; color: number;
+}
+
 export interface ShaderBackground {
   shader: Phaser.GameObjects.Shader;
   /** 難易度進行 t (0..1) を反映 */
   setProgress: (t: number) => void;
   /** ボールの状態を反映（毎フレーム） */
   setPlayfield: (s: PlayfieldState) => void;
+  /** 隙間（ライン/マーカー）の状態を反映（毎フレーム）。g=null で非表示。 */
+  setGap: (g: GapState | null, lineGlowStr: number) => void;
 }
 
 /**
@@ -161,6 +200,9 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
     ballGlowColor: { type: '3f', value: rgb(GAME.BALL_COLOR_START) },
     ballGlowStr: { type: '1f', value: 0 },
     ballVel: { type: '2f', value: { x: 0, y: 0 } },
+    gap: { type: '4f', value: { x: 0, y: GAME.WIDTH, z: GAME.LINE_Y, w: 0 } },
+    gapColor: { type: '3f', value: rgb(GAME.LINE_COLOR) },
+    lineGlowStr: { type: '1f', value: 0 },
   });
 
   // 注: scrollFactor は既定(1,1)のまま。ニアミスのカメラズーム時に背景+ボールが
@@ -179,6 +221,15 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
       shader.setUniform('ballGlowColor.value', rgb(s.glowColor));
       shader.setUniform('ballGlowStr.value', s.glowStr);
       shader.setUniform('ballVel.value', { x: s.velX, y: s.velY });
+    },
+    setGap: (g: GapState | null, lineGlowStr: number) => {
+      if (g) {
+        shader.setUniform('gap.value', { x: g.leftEdge, y: g.rightEdge, z: g.y, w: g.alpha });
+        shader.setUniform('gapColor.value', rgb(g.color));
+      } else {
+        shader.setUniform('gap.value', { x: 0, y: GAME.WIDTH, z: GAME.LINE_Y, w: 0 });
+      }
+      shader.setUniform('lineGlowStr.value', lineGlowStr);
     },
   };
 }

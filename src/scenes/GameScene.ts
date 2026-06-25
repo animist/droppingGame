@@ -486,18 +486,27 @@ export class GameScene extends Phaser.Scene {
 
     // ライン/マーカーの加算グロー（postFXパスの代替）。位置・大きさは oscillateLines で追従、
     // alpha 呼吸は update で lineGlows をまとめて更新。色は旧 Glow 既定に合わせ白。
+    // shaderモードではライン/マーカー/グローをシェーダが描くので Phaser 側は非表示にする
+    // （物理ボディは残るので当たり判定は不変。グロースプライトは生成自体を省く）。
     this.lineGlows = [];
-    const a0 = this.glowAlpha(GAME.GLOW_LINE);
-    const ll = this.makeGlowSprite(0xffffff, -0.5);
-    const rl = this.makeGlowSprite(0xffffff, -0.5);
-    const lm = this.makeGlowSprite(0xffffff, -0.5);
-    const rm = this.makeGlowSprite(0xffffff, -0.5);
-    // 非nullなら参照保持＋初期alpha＋初期同期。null(lowティア)時は never 代入を避ける
-    if (ll) { this.leftLineGlow = ll.setAlpha(a0); this.lineGlows.push(ll); }
-    if (rl) { this.rightLineGlow = rl.setAlpha(a0); this.lineGlows.push(rl); }
-    if (lm) { this.leftMarkerGlow = lm.setAlpha(a0); this.lineGlows.push(lm); }
-    if (rm) { this.rightMarkerGlow = rm.setAlpha(a0); this.lineGlows.push(rm); }
-    this.syncLineGlows();
+    if (!this.shaderBg) {
+      const a0 = this.glowAlpha(GAME.GLOW_LINE);
+      const ll = this.makeGlowSprite(0xffffff, -0.5);
+      const rl = this.makeGlowSprite(0xffffff, -0.5);
+      const lm = this.makeGlowSprite(0xffffff, -0.5);
+      const rm = this.makeGlowSprite(0xffffff, -0.5);
+      // 非nullなら参照保持＋初期alpha＋初期同期。null(lowティア)時は never 代入を避ける
+      if (ll) { this.leftLineGlow = ll.setAlpha(a0); this.lineGlows.push(ll); }
+      if (rl) { this.rightLineGlow = rl.setAlpha(a0); this.lineGlows.push(rl); }
+      if (lm) { this.leftMarkerGlow = lm.setAlpha(a0); this.lineGlows.push(lm); }
+      if (rm) { this.rightMarkerGlow = rm.setAlpha(a0); this.lineGlows.push(rm); }
+      this.syncLineGlows();
+    } else {
+      this.leftLine.setVisible(false);
+      this.rightLine.setVisible(false);
+      this.leftMarker.setVisible(false);
+      this.rightMarker.setVisible(false);
+    }
 
     this.physics.add.collider(this.ball, this.leftLine, () => this.onBounce());
     this.physics.add.collider(this.ball, this.rightLine, () => this.onBounce());
@@ -765,6 +774,25 @@ export class GameScene extends Phaser.Scene {
         velX: moving ? body.velocity.x : 0,
         velY: moving ? body.velocity.y : 0,
       });
+      // ライン/マーカー: 現在の this.leftLine/rightLine の幾何をそのまま供給。
+      // スクロール中は this.leftLine が旧ライン（上昇中）、完了後は新ライン（下から登場）を
+      // 指すので、単一の隙間供給だけで退場/登場の両方が描ける。
+      const linePulse = Math.sin(_time * 0.001 * GAME.GLOW_LINE_PULSE_FREQ) * GAME.GLOW_LINE_PULSE_AMP;
+      const lineGlowStr = this.glowAlpha(GAME.GLOW_LINE + linePulse);
+      if (this.leftLine && this.rightLine) {
+        this.shaderBg.setGap(
+          {
+            leftEdge: this.leftLine.x + this.leftLine.width / 2,
+            rightEdge: this.rightLine.x - this.rightLine.width / 2,
+            y: this.leftLine.y,
+            alpha: this.leftLine.alpha,
+            color: this.leftLine.fillColor,
+          },
+          lineGlowStr,
+        );
+      } else {
+        this.shaderBg.setGap(null, lineGlowStr);
+      }
     }
 
     if (this.isGameOver || this.isScrolling || !body) return;
