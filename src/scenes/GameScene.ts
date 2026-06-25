@@ -9,7 +9,7 @@ import { lerpColor, brighten } from '../util/color';
 import { addBackgroundShade, addWarningVignette } from '../util/bgShade';
 import { getQuality } from '../config/quality';
 import { enableWakeLock, disableWakeLock } from '../util/wakelock';
-import { getRendererMode } from '../render/rendererMode';
+import { getRendererMode, isBloomEnabled } from '../render/rendererMode';
 import { addShaderBackground, ShaderBackground } from '../render/backgroundShader';
 
 export class GameScene extends Phaser.Scene {
@@ -171,6 +171,16 @@ export class GameScene extends Phaser.Scene {
       // パララックス(-10)の手前・ゲームプレイ要素の奥に敷き、ドットごと薄く沈めて奥行きを出す
       addBackgroundShade(this, -9);
     }
+
+    // Phase 3: ブルーム（PostFX）。星・ボール・グロー・ラインを発光させる仕上げ。
+    // 全画面マルチパスで負荷があるため shaderモード かつ 高ティア(glow) のときだけ適用。
+    // restart で重複追加しないよう先に clear。重い場合は setBloomEnabled(false) で無効化可。
+    this.cameras.main.postFX.clear();
+    if (this.shaderBg && isBloomEnabled() && getQuality().glow) {
+      // color, offsetX, offsetY, blurStrength, strength, steps（stepsは負荷直結なので控えめ3）
+      this.cameras.main.postFX.addBloom(0xffffff, 1, 1, 1.0, 0.7, 3);
+    }
+
     // 警告用の赤ビネット（alpha 0 で常駐、警告中だけ脈動）
     this.warnVignette = addWarningVignette(this, 930);
 

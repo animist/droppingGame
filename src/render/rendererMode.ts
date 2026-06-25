@@ -17,3 +17,15 @@ export function getRendererMode(): RendererMode {
 export function setRendererMode(m: RendererMode): void {
   mode = m;
 }
+
+// ブルーム（PostFX）。全画面マルチパスでモバイル負荷があるため高ティア時のみ適用する。
+// 重い場合は false にして無効化できる。
+let bloom = true;
+
+export function isBloomEnabled(): boolean {
+  return bloom;
+}
+
+export function setBloomEnabled(b: boolean): void {
+  bloom = b;
+}
