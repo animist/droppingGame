@@ -39,7 +39,8 @@ export class GameScene extends Phaser.Scene {
   private warningTween: Phaser.Tweens.Tween | null = null;
   private warnVignette: Phaser.GameObjects.Image | null = null;   // 警告中に脈動する赤ビネット
   private warnVignetteTween: Phaser.Tweens.Tween | null = null;
-  private shaderBg: ShaderBackground | null = null;               // shaderモード時の手続き背景（classic時はnull）
+  private shaderBg: ShaderBackground | null = null;               // shaderモード時の手続き背景+ボール（classic時はnull）
+  private ballExploded = false;                                   // 死亡演出でボールを破裂させたか（shader描画を消す）
   private guideTexts: Phaser.GameObjects.Text[] = [];             // 初回プレイの操作ガイド
   private bounceCount = 0;
   private perfectStreak = 0;
@@ -131,6 +132,7 @@ export class GameScene extends Phaser.Scene {
     this.gammaRest = 0;
     this.gammaCalibrated = false;
     this.ballGlow = null;
+    this.ballExploded = false;
     this.lineGlows = [];
     this.parallaxScrolling = false;
     this.nextMilestoneIdx = 0;
@@ -270,6 +272,14 @@ export class GameScene extends Phaser.Scene {
       this.ball.x - radius * 0.35, this.ball.y - radius * 0.35,
       Math.max(2, radius * 0.28), 0xffffff, 0.3,
     );
+
+    // shaderモードではボール本体/ハイライト/グローはシェーダが描くので Phaser 側は非表示
+    // （物理ボディは残るので当たり判定は不変）。トレイルもシェーダ側で描くため emit を止める。
+    if (this.shaderBg) {
+      this.ball.setVisible(false);
+      this.ballHighlight.setVisible(false);
+      this.ballGlow?.setVisible(false);
+    }
   }
 
   // ハイライトをボールの現在位置・変形（スクワッシュ／ストレッチ含む）に追従させる
@@ -738,6 +748,25 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
+    // shaderモード: ボールの状態をシェーダへ毎フレーム供給（スクロール中も追従）
+    if (this.shaderBg) {
+      const pulse = Math.sin(_time * 0.001 * GAME.GLOW_PULSE_FREQ) * GAME.GLOW_PULSE_AMP;
+      const moving = body && body.enable && !this.frozen;
+      this.shaderBg.setPlayfield({
+        x: this.ball.x,
+        y: this.ball.y,
+        radius: this.ballExploded ? 0 : this.ballDiameter / 2,
+        rot: this.ball.rotation,
+        scaleX: this.ball.scaleX,
+        scaleY: this.ball.scaleY,
+        color: this.ball.fillColor,
+        glowColor: brighten(this.ball.fillColor, GAME.GLOW_BALL_BRIGHTEN),
+        glowStr: this.ballExploded ? 0 : this.glowAlpha(this.ballGlowBase + pulse),
+        velX: moving ? body.velocity.x : 0,
+        velY: moving ? body.velocity.y : 0,
+      });
+    }
+
     if (this.isGameOver || this.isScrolling || !body) return;
 
     this.oscillateLines(_time);
@@ -1031,6 +1060,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   private spawnTrailDot() {
+    if (this.shaderBg) return; // shaderモードではトレイルはシェーダが描く
     // サイズ・色はエミッタの onEmit がボール状態を参照するので位置指定だけでよい
     this.trailEmitter.emitParticleAt(this.ball.x, this.ball.y);
   }
@@ -1575,6 +1605,7 @@ export class GameScene extends Phaser.Scene {
     this.tweens.killTweensOf(this.ball);
     this.ball.setVisible(false);
     this.ballHighlight.setVisible(false);
+    this.ballExploded = true; // shader側のボール描画も消す（半径0で送る）
 
     const n = Math.max(8, Math.round(GAME.DEATH_PARTICLE_COUNT * getQuality().particleScale));
     this.deathEmitter.explode(n, x, y);

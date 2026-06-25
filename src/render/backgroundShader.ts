@@ -2,24 +2,24 @@ import Phaser from 'phaser';
 import { GAME } from '../config/balance';
 
 /**
- * Phase 1: 手続き背景シェーダ。
- * 既存の「フラット背景色 + パララックス54ドット + bgShade」を1枚のフラグメントシェーダに置換する。
+ * シーンシェーダ（背景 + ボールのプレイフィールド）。
  *
- * - 縦グラデ＋難易度進行(progress)での色補間（classic の BG_COLOR_START→END と同等）
- * - ゆるい星雲 + 上方向に流れる多層スターフィールド（パララックスの奥行き感の代替、全部GPU側で生成）
- * - 軽いビネット
+ * Phaser の Shader GameObject はアルファ合成が不定なため、透明オーバーレイ方式は採らず
+ * 「背景 → トレイル → グロー → ボール本体 → ハイライト」を1枚の不透明シェーダ内で正しい順に
+ * 合成する。ライン/マーカー/パーティクル/文字は従来通り Phaser オブジェクトとして上に重ねる。
  *
- * 動的 uniform は progress(1f) のみ。time/resolution は Phaser の Shader GO が自動更新する。
+ * uniform:
+ *  - 自動: time / resolution（Phaser が供給・更新）
+ *  - 背景: progress(1f)
+ *  - ボール: ball(4f=x,y,r,rot) / ballScale(2f) / ballColor(3f) / ballGlowColor(3f)
+ *           / ballGlowStr(1f) / ballVel(2f)
  *
- * 注意: smoothstep(edge0, edge1, x) は edge0 >= edge1 だと結果が未定義（ドライバによりNaN→黒画面）。
- *       必ず edge0 < edge1 にし、反転は `1.0 - smoothstep(...)` で行う。
+ * モバイル注意: precision は highp（mediumpの16bitでInf/NaN→黒画面回避）。fwidth不使用、
+ *   smoothstepは必ず edge0<edge1、組み込み名(dot等)と変数衝突させない、0除算はmaxで回避。
  */
 
 // balance.ts と同期: BG_COLOR_START=0x1a1a2e, BG_COLOR_END=0x4a081f
-// 0x1a/255=0.102, 0x2e/255=0.180 / 0x4a/255=0.290, 0x08/255=0.031, 0x1f/255=0.122
 const FRAG = `
-// モバイル(Android Chrome等)は mediump を本当に16bitで扱い、大きな中間値で Inf/NaN→黒画面に
-// なる。対応端末では highp を使う（PCは元々32bit相当なので影響なし）。
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
@@ -28,23 +28,30 @@ precision mediump float;
 
 uniform float time;
 uniform vec2 resolution;
-uniform float progress;   // 0=序盤色, 1=終盤色（難易度進行）
+uniform float progress;
+
+uniform vec4 ball;        // x, y, radius, rotation
+uniform vec2 ballScale;   // scaleX, scaleY
+uniform vec3 ballColor;
+uniform vec3 ballGlowColor;
+uniform float ballGlowStr;
+uniform vec2 ballVel;
 
 varying vec2 fragCoord;
 
 const vec3 COL_START = vec3(0.102, 0.102, 0.180); // 青紫
-const vec3 COL_END   = vec3(0.290, 0.031, 0.122); // 赤紫
+// ピンチ時の終端色。赤すぎてボールが埋もれないよう暗いトーンの深紅にする
+// （shader用の調整値。classicの BG_COLOR_END とは意図的に別）
+const vec3 COL_END   = vec3(0.150, 0.020, 0.060); // 暗い深紅
 
-// 中間値を小さく保つ精度耐性の高いハッシュ（Hoskins系）。mediumpフォールバックでも壊れにくい。
 float hash21(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
   p3 += dot(p3, p3.yzx + 33.33);
   return fract((p3.x + p3.y) * p3.z);
 }
 
-// 上方向へ流れる1層分のスターフィールド。セル分割して一部のセルに点を置く。
 float starLayer(vec2 uv, float scale, float speed, float density) {
-  uv.y -= time * speed;          // 下→上（上方向）へ流れる。classicのパララックス上昇と一致
+  uv.y -= time * speed;          // 下→上（上方向）へ流れる
   uv *= scale;
   vec2 cell = floor(uv);
   vec2 f = fract(uv) - 0.5;
@@ -52,67 +59,126 @@ float starLayer(vec2 uv, float scale, float speed, float density) {
   float on = step(1.0 - density, h);
   vec2 jitter = (vec2(hash21(cell + 1.7), hash21(cell + 3.3)) - 0.5) * 0.6;
   float d = length(f - jitter);
-  // 中心(d=0)で1、半径0.16で0。smoothstepは edge0<edge1 にして反転で立ち上げる。
-  // ※変数名は組み込み関数 dot() と衝突しないよう spark にする（衝突するとコンパイル失敗）。
-  float spark = 1.0 - smoothstep(0.0, 0.16, d);
-  float tw = 0.6 + 0.4 * sin(time * (1.0 + h * 2.0) + h * 6.28); // ほのかな明滅
+  float spark = 1.0 - smoothstep(0.0, 0.09, d); // 小さめの点
+  float tw = 0.6 + 0.4 * sin(time * (1.0 + h * 2.0) + h * 6.28);
   return spark * on * tw;
 }
 
 void main(void) {
-  vec2 uv = fragCoord / resolution;            // 0..1
+  vec2 uv = fragCoord / resolution;            // 0..1（y上）
 
-  // ベース色: 難易度進行で青紫→赤紫、さらに縦グラデで下を少し明るく
+  // ---- 背景 ----
   vec3 base = mix(COL_START, COL_END, clamp(progress, 0.0, 1.0));
   base *= mix(0.90, 1.20, uv.y);
-
-  // ゆるい星雲（低周波の明暗で奥行きを出す）
   float neb = sin(uv.x * 4.0 + time * 0.05) * sin(uv.y * 3.0 - time * 0.04);
-  base += mix(vec3(0.04, 0.05, 0.10), vec3(0.12, 0.03, 0.06), clamp(progress, 0.0, 1.0))
+  base += mix(vec3(0.04, 0.05, 0.10), vec3(0.06, 0.015, 0.03), clamp(progress, 0.0, 1.0))
           * (0.5 + 0.5 * neb);
-
-  // アスペクト比を考慮した座標（点が縦長に潰れないように）
   vec2 auv = vec2(uv.x * (resolution.x / resolution.y), uv.y);
-
-  // 3層スターフィールド（奥ほど小さく遅く暗い＝パララックス）
   float stars = 0.0;
-  stars += starLayer(auv, 5.0,  0.015, 0.20) * 0.6; // 遠
-  stars += starLayer(auv, 9.0,  0.030, 0.16) * 1.0; // 中
-  stars += starLayer(auv, 15.0, 0.055, 0.12) * 1.5; // 近
-  // 星の色は進行に応じてやや暖色へ寄せる
+  stars += starLayer(auv, 6.0,  0.015, 0.14) * 0.25; // 遠（暗め・控えめ）
+  stars += starLayer(auv, 11.0, 0.030, 0.11) * 0.40; // 中
+  stars += starLayer(auv, 17.0, 0.055, 0.08) * 0.60; // 近
   vec3 starCol = mix(vec3(0.85, 0.88, 1.0), vec3(1.0, 0.88, 0.85), clamp(progress, 0.0, 1.0));
-
   vec3 col = base + starCol * stars;
+  float vg = distance(uv, vec2(0.5));
+  col *= 1.0 - 0.30 * vg * vg;
 
-  // 軽いビネット
-  float v = distance(uv, vec2(0.5));
-  col *= 1.0 - 0.30 * v * v;
+  // ---- プレイフィールド（ボール）----
+  // ゲーム空間ピクセル座標（y下＝Phaserのワールドと一致）
+  vec2 P = vec2(fragCoord.x, resolution.y - fragCoord.y);
+  vec2 bc = ball.xy;
+  float br = ball.z;
+  float brot = ball.w;
+
+  // モーショントレイル（速度の逆方向へ伸びるカプセル）
+  float sp = length(ballVel);
+  float trailAmt = 0.30 * smoothstep(150.0, 600.0, sp);
+  if (trailAmt > 0.001) {
+    vec2 dir = ballVel / max(sp, 1.0);
+    vec2 a = bc;
+    vec2 b = bc - dir * min(sp * 0.12, br * 5.0);
+    vec2 pa = P - a;
+    vec2 ba = b - a;
+    float hh = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0), 0.0, 1.0);
+    float dCap = length(pa - ba * hh) - br * 0.6;
+    float cap = (1.0 - smoothstep(-1.0, 6.0, dCap)) * (1.0 - hh);
+    col += ballColor * cap * trailAmt;
+  }
+
+  // ボールローカル系へ（-brot 回転 → スケール解除）。スケールで簡易な楕円化（スクワッシュ）。
+  vec2 q = P - bc;
+  float ca = cos(brot), sa = sin(brot);
+  q = mat2(ca, -sa, sa, ca) * q;
+  q /= max(ballScale, vec2(0.001));
+  float dBall = length(q) - br;
+
+  // グロー（ボールの背後・加算）
+  float glow = exp(-max(dBall, 0.0) * 0.05) * ballGlowStr;
+  col += ballGlowColor * glow;
+
+  // ボール本体（約3pxのAAで縁をなめらかに）
+  float ballMask = 1.0 - smoothstep(-1.5, 1.5, dBall);
+  col = mix(col, ballColor, ballMask);
+
+  // 左上の白ハイライト（球体感）。ボール内側にのみ乗せる
+  vec2 hp = bc + vec2(-0.30 * br, -0.30 * br);
+  float dh = length(P - hp) - br * 0.30;
+  float hl = (1.0 - smoothstep(-1.0, 1.0, dh)) * ballMask * 0.45;
+  col += vec3(1.0) * hl;
 
   gl_FragColor = vec4(col, 1.0);
 }
 `;
 
+function rgb(n: number) {
+  return { x: ((n >> 16) & 255) / 255, y: ((n >> 8) & 255) / 255, z: (n & 255) / 255 };
+}
+
+export interface PlayfieldState {
+  x: number; y: number; radius: number; rot: number;
+  scaleX: number; scaleY: number;
+  color: number; glowColor: number; glowStr: number;
+  velX: number; velY: number;
+}
+
 export interface ShaderBackground {
   shader: Phaser.GameObjects.Shader;
   /** 難易度進行 t (0..1) を反映 */
   setProgress: (t: number) => void;
+  /** ボールの状態を反映（毎フレーム） */
+  setPlayfield: (s: PlayfieldState) => void;
 }
 
 /**
- * 画面全体を覆う背景シェーダを最背面に追加する。WebGL前提（呼び出し側でガード）。
+ * 画面全体を覆うシーンシェーダ（背景+ボール）を最背面に追加する。WebGL前提（呼び出し側でガード）。
  */
 export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderBackground {
-  const base = new Phaser.Display.BaseShader('dropBg', FRAG, undefined, {
+  const base = new Phaser.Display.BaseShader('dropScene', FRAG, undefined, {
     progress: { type: '1f', value: 0 },
+    ball: { type: '4f', value: { x: GAME.WIDTH / 2, y: GAME.BALL_START_Y, z: GAME.BALL_INITIAL_DIAMETER / 2, w: 0 } },
+    ballScale: { type: '2f', value: { x: 1, y: 1 } },
+    ballColor: { type: '3f', value: rgb(GAME.BALL_COLOR_START) },
+    ballGlowColor: { type: '3f', value: rgb(GAME.BALL_COLOR_START) },
+    ballGlowStr: { type: '1f', value: 0 },
+    ballVel: { type: '2f', value: { x: 0, y: 0 } },
   });
 
+  // 注: scrollFactor は既定(1,1)のまま。ニアミスのカメラズーム時に背景+ボールが
+  //     ライン/パーティクルと一緒に拡縮するよう、あえて固定しない。
   const shader = scene.add
     .shader(base, GAME.WIDTH / 2, GAME.HEIGHT / 2, GAME.WIDTH, GAME.HEIGHT)
-    .setDepth(depth)
-    .setScrollFactor(0); // ニアミスのカメラズーム等で背景がブレないよう固定
+    .setDepth(depth);
 
   return {
     shader,
     setProgress: (t: number) => shader.setUniform('progress.value', t),
+    setPlayfield: (s: PlayfieldState) => {
+      shader.setUniform('ball.value', { x: s.x, y: s.y, z: s.radius, w: s.rot });
+      shader.setUniform('ballScale.value', { x: s.scaleX, y: s.scaleY });
+      shader.setUniform('ballColor.value', rgb(s.color));
+      shader.setUniform('ballGlowColor.value', rgb(s.glowColor));
+      shader.setUniform('ballGlowStr.value', s.glowStr);
+      shader.setUniform('ballVel.value', { x: s.velX, y: s.velY });
+    },
   };
 }
