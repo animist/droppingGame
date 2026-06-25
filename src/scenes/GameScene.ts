@@ -9,6 +9,8 @@ import { lerpColor, brighten } from '../util/color';
 import { addBackgroundShade, addWarningVignette } from '../util/bgShade';
 import { getQuality } from '../config/quality';
 import { enableWakeLock, disableWakeLock } from '../util/wakelock';
+import { getRendererMode } from '../render/rendererMode';
+import { addShaderBackground, ShaderBackground } from '../render/backgroundShader';
 
 export class GameScene extends Phaser.Scene {
   private ball!: Phaser.GameObjects.Arc;
@@ -37,6 +39,7 @@ export class GameScene extends Phaser.Scene {
   private warningTween: Phaser.Tweens.Tween | null = null;
   private warnVignette: Phaser.GameObjects.Image | null = null;   // 警告中に脈動する赤ビネット
   private warnVignetteTween: Phaser.Tweens.Tween | null = null;
+  private shaderBg: ShaderBackground | null = null;               // shaderモード時の手続き背景（classic時はnull）
   private guideTexts: Phaser.GameObjects.Text[] = [];             // 初回プレイの操作ガイド
   private bounceCount = 0;
   private perfectStreak = 0;
@@ -147,9 +150,25 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.setBackgroundColor(GAME.BG_COLOR_START);
 
     this.createParticles(); // 円テクスチャの生成を含むので先に呼ぶ（パララックスが使う）
-    this.createParallax();
-    // パララックス(-10)の手前・ゲームプレイ要素の奥に敷き、ドットごと薄く沈めて奥行きを出す
-    addBackgroundShade(this, -9);
+
+    // 背景: shaderモード(かつWebGL)なら手続きシェーダ1枚で置換。それ以外は従来のパララックス+シェード。
+    // シェーダ生成に失敗しても classic にフォールバックしてゲームは継続する（黒画面化を防ぐ）。
+    this.shaderBg = null;
+    const useShaderBg =
+      getRendererMode() === 'shader' && this.game.renderer.type === Phaser.WEBGL;
+    if (useShaderBg) {
+      try {
+        this.shaderBg = addShaderBackground(this, -20); // 最背面
+      } catch (e) {
+        console.error('[shaderBg] 生成に失敗。classic背景にフォールバックします', e);
+        this.shaderBg = null;
+      }
+    }
+    if (!this.shaderBg) {
+      this.createParallax();
+      // パララックス(-10)の手前・ゲームプレイ要素の奥に敷き、ドットごと薄く沈めて奥行きを出す
+      addBackgroundShade(this, -9);
+    }
     // 警告用の赤ビネット（alpha 0 で常駐、警告中だけ脈動）
     this.warnVignette = addWarningVignette(this, 930);
 
@@ -1114,8 +1133,13 @@ export class GameScene extends Phaser.Scene {
       ease: 'Quad.easeOut',
       onUpdate: () => {
         this.bgProgress = proxy.t;
-        const c = lerpColor(GAME.BG_COLOR_START, GAME.BG_COLOR_END, proxy.t);
-        this.cameras.main.setBackgroundColor(c);
+        if (this.shaderBg) {
+          // shaderモード: 難易度進行を背景シェーダの uniform に反映
+          this.shaderBg.setProgress(proxy.t);
+        } else {
+          const c = lerpColor(GAME.BG_COLOR_START, GAME.BG_COLOR_END, proxy.t);
+          this.cameras.main.setBackgroundColor(c);
+        }
       },
     });
   }
