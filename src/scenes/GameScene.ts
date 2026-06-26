@@ -40,6 +40,8 @@ export class GameScene extends Phaser.Scene {
   private warnVignette: Phaser.GameObjects.Image | null = null;   // 警告中に脈動する赤ビネット
   private warnVignetteTween: Phaser.Tweens.Tween | null = null;
   private shaderBg: ShaderBackground | null = null;               // shaderモード時の手続き背景+ボール（classic時はnull）
+  private trailVelX = 0;                                          // shaderトレイル用の平滑速度（遅れて追従）。バウンス急反転を吸収
+  private trailVelY = 0;
   private ballExploded = false;                                   // 死亡演出でボールを破裂させたか（shader描画を消す）
   private guideTexts: Phaser.GameObjects.Text[] = [];             // 初回プレイの操作ガイド
   private bounceCount = 0;
@@ -772,6 +774,13 @@ export class GameScene extends Phaser.Scene {
     if (this.shaderBg) {
       const pulse = Math.sin(_time * 0.001 * GAME.GLOW_PULSE_FREQ) * GAME.GLOW_PULSE_AMP;
       const moving = body && body.enable && !this.frozen;
+      // トレイル速度を平滑化（指数移動平均）。バウンスで velocity.y が一瞬で反転しても
+      // 平滑速度は遅れて追従し0付近を通過するため、トレイルが急反転せず一瞬縮んで伸び直す。
+      const tvK = 1 - Math.exp(-delta / GAME.TRAIL_VEL_SMOOTH_MS);
+      const tgtVX = moving ? body!.velocity.x : 0;
+      const tgtVY = moving ? body!.velocity.y : 0;
+      this.trailVelX += (tgtVX - this.trailVelX) * tvK;
+      this.trailVelY += (tgtVY - this.trailVelY) * tvK;
       this.shaderBg.setPlayfield({
         x: this.ball.x,
         y: this.ball.y,
@@ -782,8 +791,8 @@ export class GameScene extends Phaser.Scene {
         color: this.ball.fillColor,
         glowColor: brighten(this.ball.fillColor, GAME.GLOW_BALL_BRIGHTEN),
         glowStr: this.ballExploded ? 0 : this.glowAlpha(this.ballGlowBase + pulse),
-        velX: moving ? body.velocity.x : 0,
-        velY: moving ? body.velocity.y : 0,
+        velX: this.trailVelX,
+        velY: this.trailVelY,
       });
       // ライン/マーカー: 現在の this.leftLine/rightLine の幾何をそのまま供給。
       // スクロール中は this.leftLine が旧ライン（上昇中）、完了後は新ライン（下から登場）を
@@ -804,6 +813,11 @@ export class GameScene extends Phaser.Scene {
       } else {
         this.shaderBg.setGap(null, lineGlowStr);
       }
+      // パーティクル: 凍結中はここに来ない（上で return）ので自動停止。
+      // 生delta駆動＝classicのエミッタ同様タイムダイレーションの影響を受けない。
+      // ゲームオーバー/スクロール中も飛散を継続させるため、この return より前で更新する。
+      this.shaderBg.particles.update(delta);
+      this.shaderBg.commitParticles();
     }
 
     if (this.isGameOver || this.isScrolling || !body) return;
@@ -1094,7 +1108,18 @@ export class GameScene extends Phaser.Scene {
       const driftY = (Math.random() - 0.5) * GAME.AMBIENT_DRIFT_PX - body.velocity.y * 0.06;
       this.ambToX = px + driftX;
       this.ambToY = py + driftY;
-      this.ambientEmitter.emitParticleAt(px, py);
+      if (this.shaderBg) {
+        // moveTo を寿命ぶんの線形速度で近似（半径3→0.6px / alpha0.85→0）
+        const life = GAME.AMBIENT_DURATION_MS;
+        const vx = (this.ambToX - px) / (life / 1000);
+        const vy = (this.ambToY - py) / (life / 1000);
+        this.shaderBg.particles.spawnDirected(px, py, vx, vy, {
+          radiusStart: 3, radiusEnd: 0.6, alphaStart: 0.85, alphaEnd: 0,
+          lifeMs: life, color: this.ambTint,
+        });
+      } else {
+        this.ambientEmitter.emitParticleAt(px, py);
+      }
     }
   }
 
@@ -1528,11 +1553,31 @@ export class GameScene extends Phaser.Scene {
 
   private emitBounceBurst(x: number, y: number) {
     const n = Math.max(1, Math.round(GAME.BOUNCE_PARTICLE_COUNT * getQuality().particleScale));
+    if (this.shaderBg) {
+      // 真上(-90°)中心の扇。色はその時のボール色。半径3→0.9px / alpha0.9→0。
+      this.shaderBg.particles.explode(n, x, y, {
+        speedMin: GAME.BOUNCE_PARTICLE_SPEED_MIN, speedMax: GAME.BOUNCE_PARTICLE_SPEED_MAX,
+        angleMinDeg: -150, angleMaxDeg: -30,
+        radiusStart: 3, radiusEnd: 0.9, alphaStart: 0.9, alphaEnd: 0,
+        lifeMs: GAME.BOUNCE_PARTICLE_DURATION_MS, color: () => this.ball.fillColor,
+      });
+      return;
+    }
     this.bounceEmitter.explode(n, x, y);
   }
 
   private emitBurst(x: number, y: number, count: number) {
     const n = Math.max(1, Math.round(count * getQuality().particleScale));
+    if (this.shaderBg) {
+      // 全方位バースト。色は固定のボールカラー。半径4.5→0.9px / alpha1→0。
+      this.shaderBg.particles.explode(n, x, y, {
+        speedMin: GAME.PARTICLE_SPEED_MIN, speedMax: GAME.PARTICLE_SPEED_MAX,
+        angleMinDeg: 0, angleMaxDeg: 360,
+        radiusStart: 4.5, radiusEnd: 0.9, alphaStart: 1, alphaEnd: 0,
+        lifeMs: GAME.PARTICLE_DURATION_MS, color: GAME.BALL_COLOR,
+      });
+      return;
+    }
     this.burstEmitter.explode(n, x, y);
   }
 
@@ -1647,6 +1692,17 @@ export class GameScene extends Phaser.Scene {
     this.ballExploded = true; // shader側のボール描画も消す（半径0で送る）
 
     const n = Math.max(8, Math.round(GAME.DEATH_PARTICLE_COUNT * getQuality().particleScale));
+    if (this.shaderBg) {
+      // 放射状＋重力で落下感。色はボール色／25%白。半径5.5→1.1px / alpha1→0。
+      this.shaderBg.particles.explode(n, x, y, {
+        speedMin: GAME.DEATH_PARTICLE_SPEED_MIN * 0.85, speedMax: GAME.DEATH_PARTICLE_SPEED_MAX * 0.85,
+        angleMinDeg: 0, angleMaxDeg: 360, gravity: 250,
+        radiusStart: 5.5, radiusEnd: 1.1, alphaStart: 1, alphaEnd: 0,
+        lifeMs: GAME.DEATH_PARTICLE_DURATION_MS,
+        color: () => (Math.random() < 0.25 ? 0xffffff : this.deathColor),
+      });
+      return;
+    }
     this.deathEmitter.explode(n, x, y);
   }
 }

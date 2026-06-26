@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import { GAME } from '../config/balance';
+import { ShaderParticles, MAX_PARTICLES } from './shaderParticles';
 
 /**
  * シーンシェーダ（背景 + ボールのプレイフィールド）。
@@ -40,6 +41,11 @@ uniform vec2 ballVel;
 uniform vec4 gap;          // leftEdge, rightEdge, y, alpha(0で非表示)
 uniform vec3 gapColor;     // ライン/マーカー色（通常水色/息継ぎ緑/警告赤）
 uniform float lineGlowStr; // ライングローの強度（呼吸）
+
+// パーティクル（通過バースト/バウンス/常時きらめき/破裂を1ループで合成）
+uniform int partCount;                 // 有効粒数（これ以降はbreakで読まない）
+uniform vec4 parts[${MAX_PARTICLES}];  // x, y, radius(px), alpha
+uniform vec3 partCol[${MAX_PARTICLES}];// r, g, b
 
 varying vec2 fragCoord;
 
@@ -159,6 +165,18 @@ void main(void) {
   // ---- ライン/マーカー（ボールの手前に重ねる＝classic相当）----
   drawGap(col, P, gap, gapColor, lineGlowStr);
 
+  // ---- パーティクル（最前面。classicの各エミッタをまとめてアルファ合成）----
+  // ループ上限は配列長で固定。partCount で早期break、alpha≈0はskipして実コストを抑える。
+  for (int i = 0; i < ${MAX_PARTICLES}; i++) {
+    if (i >= partCount) break;
+    vec4 pp = parts[i];
+    float pa = pp.w;
+    if (pa < 0.004) continue;
+    float dP = length(P - pp.xy) - pp.z; // 円SDF
+    float pm = (1.0 - smoothstep(-1.0, 1.5, dP)) * pa; // 約2.5pxのAA縁
+    col = mix(col, partCol[i], pm);
+  }
+
   gl_FragColor = vec4(col, 1.0);
 }
 `;
@@ -180,18 +198,24 @@ export interface GapState {
 
 export interface ShaderBackground {
   shader: Phaser.GameObjects.Shader;
+  /** シェーダ合成されるパーティクルプール（emit はこちらへ振り分ける） */
+  particles: ShaderParticles;
   /** 難易度進行 t (0..1) を反映 */
   setProgress: (t: number) => void;
   /** ボールの状態を反映（毎フレーム） */
   setPlayfield: (s: PlayfieldState) => void;
   /** 隙間（ライン/マーカー）の状態を反映（毎フレーム）。g=null で非表示。 */
   setGap: (g: GapState | null, lineGlowStr: number) => void;
+  /** プールを parts/colors バッファへ詰め直し、partCount を更新（毎フレーム） */
+  commitParticles: () => void;
 }
 
 /**
  * 画面全体を覆うシーンシェーダ（背景+ボール）を最背面に追加する。WebGL前提（呼び出し側でガード）。
  */
 export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderBackground {
+  const particles = new ShaderParticles();
+
   const base = new Phaser.Display.BaseShader('dropScene', FRAG, undefined, {
     progress: { type: '1f', value: 0 },
     ball: { type: '4f', value: { x: GAME.WIDTH / 2, y: GAME.BALL_START_Y, z: GAME.BALL_INITIAL_DIAMETER / 2, w: 0 } },
@@ -203,6 +227,10 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
     gap: { type: '4f', value: { x: 0, y: GAME.WIDTH, z: GAME.LINE_Y, w: 0 } },
     gapColor: { type: '3f', value: rgb(GAME.LINE_COLOR) },
     lineGlowStr: { type: '1f', value: 0 },
+    // パーティクル: バッファ参照をそのまま渡す（in-place更新を毎レンダー読む）。
+    partCount: { type: '1i', value: 0 },
+    parts: { type: '4fv', value: particles.parts },
+    partCol: { type: '3fv', value: particles.colors },
   });
 
   // 注: scrollFactor は既定(1,1)のまま。ニアミスのカメラズーム時に背景+ボールが
@@ -213,6 +241,8 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
 
   return {
     shader,
+    particles,
+    commitParticles: () => shader.setUniform('partCount.value', particles.writeBuffers()),
     setProgress: (t: number) => shader.setUniform('progress.value', t),
     setPlayfield: (s: PlayfieldState) => {
       shader.setUniform('ball.value', { x: s.x, y: s.y, z: s.radius, w: s.rot });
