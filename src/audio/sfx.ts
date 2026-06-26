@@ -210,6 +210,12 @@ export function playPass(pan = 0) {
   setTimeout(() => tone({ freq: 1760, duration: 0.16, type: 'triangle', volume: 0.2, pan }), 110);
 }
 
+// PERFECT連続が途切れた瞬間の負の余韻（短い鈍い下降）。ゲームオーバーより軽く、通過より暗く。
+export function playStreakLost() {
+  tone({ freq: 440, freqEnd: 392, duration: 0.12, type: 'sawtooth', volume: 0.13 });
+  setTimeout(() => tone({ freq: 294, freqEnd: 233, duration: 0.28, type: 'triangle', volume: 0.16 }), 90);
+}
+
 // ニアミス: 鋭い上向きの「ヒュッ」という緊張感のある音
 export function playNearMiss(pan = 0) {
   tone({ freq: 600, freqEnd: 1500, duration: 0.16, type: 'sawtooth', volume: 0.16, pan });
@@ -283,12 +289,124 @@ export function playGameOverE() {
   tone({ freq: 370, duration: 0.70, type: 'triangle', volume: 0.18 });
 }
 
-export function playPerfectPass(streakCents = 0, pan = 0) {
-  const mult = Math.pow(2, streakCents / 1200);
-  tone({ freq: 1175 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan });
-  setTimeout(() => tone({ freq: 1568 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan }), 50);
-  setTimeout(() => tone({ freq: 1976 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan }), 100);
-  setTimeout(() => tone({ freq: 2349 * mult, duration: 0.22, type: 'triangle', volume: 0.22, pan }), 150);
+// PERFECT通過（アイデアA「ドレミ階段」/ 周回オクターブ上げ版）。
+// Cメジャー(=Aナチュラルマイナー)のドレミファソラシドを、PERFECT連続1回につき1段ずつ登る。
+// 1オクターブ登り切ったら次は1オクターブ上で再びドレミファ…と繰り返す（＝連続が伸びるほど
+// どんどん高いキーへ）。耳保護のため上限オクターブで頭打ち。途切れれば streak=1 で最下段に戻る。
+// C major は BGM(Am→F) と同じ音集合なので在keyのまま溶ける。
+const A_SCALE = [
+  523.25,  // C5
+  587.33,  // D5
+  659.25,  // E5
+  698.46,  // F5
+  783.99,  // G5
+  880.0,   // A5
+  987.77,  // B5
+];
+const A_SCALE_MAX_OCTAVE = 2; // 周回の上限（+2オクターブ＝最高でB7付近。これ以上は上げない）
+
+// step（0始まり）→ 音階＋周回オクターブ の周波数
+function aScaleFreq(step: number): number {
+  const n = A_SCALE.length;
+  const octave = Math.min(A_SCALE_MAX_OCTAVE, Math.floor(step / n));
+  return A_SCALE[step % n] * Math.pow(2, octave);
+}
+
+export function playPerfectPass(streak = 1, pan = 0) {
+  const step = Math.max(0, streak - 1);
+  const lead = aScaleFreq(step);
+  const below = aScaleFreq(Math.max(0, step - 1)); // 一つ下の段（オクターブ跨ぎも自然に追従）
+  // 一段下→リード音への短い登り。音量はかなり控えめ。
+  tone({ freq: below, duration: 0.06, type: 'triangle', volume: 0.045, pan });
+  setTimeout(() => tone({ freq: lead, duration: 0.22, type: 'triangle', volume: 0.10, pan }), 55);
+}
+
+// === アイデアB: PERFECT連続で積み上がる持続コード（パッド） ===
+// PERFECTごとに1声を低→高へ積み、鳴らし続ける＝チェーンが分厚い和音に育つ。
+// streakが途切れると collapseChord() でピッチを落としながら崩落＝「育てて失う」を音で体現。
+// メロSE(A, 高域C6〜)の“下”を埋める低めの帯域に置き、両者がぶつからないようにする。
+interface ChordVoice { osc: OscillatorNode; gain: GainNode; }
+
+// 低→高の積層音（Aマイナーペンタの土台）。1周=この本数。周回ごとにスウェルさせる。
+const CHORD_STACK = [
+  220.0,   // A3（土台ドローン）
+  329.63,  // E4
+  440.0,   // A4
+  523.25,  // C5
+  587.33,  // D5
+  659.25,  // E5
+  783.99,  // G5
+  880.0,   // A5
+];
+// 1声あたりの音量。ごくかすかから始め、飽和（声数頭打ち）ではなく「周回スウェル」で育てる:
+//  - 1周目(streak 1..8): 各音を BASE でフェードイン＝薄い和音が出来る
+//  - 2周目以降: 同じ音をもう一度通るたびに +LAP ずつ持ち上げ、同じ和音が徐々に厚くなる
+//    （音程は増やさない＝濁らせない）。MAX でゆるく頭打ち。
+// 各音の音量。ピッチは上げず（同じ和音のまま）、周回ごとに音量だけを加算して育てる。
+const CHORD_VOICE_GAIN_BASE = 0.01;    // 1周目の各音の音量
+const CHORD_VOICE_GAIN_LAP = 0.00375;  // 周回ごとに各音へ加える増分
+const CHORD_VOICE_GAIN_MAX = 0.026;    // 各音の上限
+
+// index = CHORD_STACK の位置。周回で同じ位置を再訪して音量を上げる。
+const chordSlots: (ChordVoice | null)[] = new Array(CHORD_STACK.length).fill(null);
+
+// PERFECT連続数に応じて積む/育てる。pos=周回内の位置, lap=周回数(0始まり)。
+export function addChordLayer(streak: number) {
+  if (!ctx || !masterGain) return;
+  if (ctx.state !== 'running') { tryResume(); return; }
+  if (streak < 1) return;
+  const n = CHORD_STACK.length;
+  const pos = (streak - 1) % n;
+  const lap = Math.floor((streak - 1) / n);
+  const now = ctx.currentTime;
+  const target = Math.min(CHORD_VOICE_GAIN_MAX, CHORD_VOICE_GAIN_BASE + lap * CHORD_VOICE_GAIN_LAP);
+  const v = chordSlots[pos];
+  if (!v) {
+    // 新規声: 0 から目標音量へクリーンにフェードイン。
+    // ※ここで cancelScheduledValues+setValueAtTime(value) をやると、未処理の
+    //   setValueAtTime(0) がキャンセルされ value=デフォルト1.0 にピン留めされて
+    //   「1.0→目標」の下降ブリップが鳴る（過去のバグ）。新規声では絶対にやらない。
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(CHORD_STACK[pos], now);
+    osc.detune.setValueAtTime((Math.random() * 2 - 1) * 6, now); // わずかな広がり
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(target, now + 0.2);
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(now);
+    chordSlots[pos] = { osc, gain };
+  } else {
+    // 既存声: 現在の実値から目標へ再ターゲット（2周目以降の音量スウェル）
+    v.gain.gain.cancelScheduledValues(now);
+    v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+    v.gain.gain.linearRampToValueAtTime(target, now + 0.2);
+  }
+}
+
+// 積み上げたコードを崩す（streak途切れ／ゲームオーバー時）。ピッチを落としながら消す。
+export function collapseChord() {
+  if (!ctx) {
+    chordSlots.fill(null);
+    return;
+  }
+  const now = ctx.currentTime;
+  for (let i = 0; i < chordSlots.length; i++) {
+    const v = chordSlots[i];
+    if (!v) continue;
+    try {
+      v.gain.gain.cancelScheduledValues(now);
+      v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+      v.gain.gain.linearRampToValueAtTime(0, now + 0.3);
+      v.osc.detune.cancelScheduledValues(now);
+      v.osc.detune.linearRampToValueAtTime(-700, now + 0.3); // 崩れる感じに下げる
+      v.osc.stop(now + 0.34);
+    } catch {
+      // 既に停止済みのノードは無視
+    }
+    chordSlots[i] = null;
+  }
 }
 
 let fallOsc: OscillatorNode | null = null;

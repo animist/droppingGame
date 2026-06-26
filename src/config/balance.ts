@@ -239,6 +239,24 @@ export const GAME = {
   MUSIC_INTENSITY_2: 16,               // スコアこの値以上でハイハット追加（intensity 2）
   MUSIC_INTENSITY_3: 32,               // スコアこの値以上で上声追加（intensity 3）
 
+  // --- バイオーム（スコア帯で背景パレットが変わる＝エンドレスに旅情を与える）---
+  // shaderモード専用。score がしきい値以上で最大のゾーンを採用し、パレットを滑らかに遷移。
+  // cool=安全時の基調色、hot=危険(progress=1)時の終端色。zone0 は現行 BG と同等。
+  // ※赤い「危険」サインは別途ビネット脈動＋ライン赤化が担うので、hotは各ゾーンの濃色でよい。
+  BIOME_TRANSITION_MS: 1500,           // ゾーン切替時のパレット遷移時間（ms）
+  BIOMES: [
+    { score: 0,   cool: 0x1a1a2e, hot: 0x26050f }, // 宙（青紫）＝現行
+    { score: 25,  cool: 0x06222b, hot: 0x07343a }, // 深海（ティール）
+    { score: 75,  cool: 0x0a2410, hot: 0x143a12 }, // 樹海（緑）
+    { score: 150, cool: 0x2b1606, hot: 0x49230a }, // 黄昏（琥珀）
+    { score: 300, cool: 0x1b0630, hot: 0x340a4a }, // 深淵（紫）
+  ] as { score: number; cool: number; hot: number }[],
+
+  // --- ストリーク喪失演出（PERFECT連続が途切れた瞬間の負の余韻）---
+  STREAK_LOST_MIN: 3,                  // この連続数以上を失った時だけ発動（小さな途切れは無視）
+  STREAK_LOST_FLASH_ALPHA: 0.34,       // 脱色フラッシュ（暗いグレー）の濃さ
+  STREAK_LOST_FLASH_MS: 380,           // フラッシュのフェード時間（ms）
+
   // --- 背景パララックス（奥行きのある動く背景）---
   PARALLAX_DRIFT_SPEED: 1.0,           // 全体のドリフト速度倍率（大きいほど速く流れる）
   PARALLAX_FAR_COUNT: 24,              // 遠景レイヤーの点の数

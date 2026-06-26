@@ -9,6 +9,7 @@ import { getMusicBus } from './sfx';
 
 let schedulerId: number | null = null;
 let nextNoteTime = 0;
+let seqStartTime = 0;   // step0 が鳴る基準時刻（getCurrentChord で現在の小節位置を算出）
 let step = 0;
 let intensity = 0;
 let running = false;
@@ -33,6 +34,31 @@ const ARP: number[] = [
   349.23, 440.00, 523.25, 440.00,
 ];
 const HAT_STEPS = [2, 6, 10, 14];
+
+// --- 効果音をBGMのキーに合わせるためのコード構成音ラダー ---
+// 小節前半=Am(A,C,E)、後半=F(F,A,C)。SFXがBGMの上に乗る高めの音域で、
+// 低→高に並べた「上れるハシゴ」。通過音はこの低位、PERFECTはストリークぶん上って鳴らす。
+const AM_LADDER = [880.0, 1046.5, 1318.51, 1760.0, 2093.0, 2637.02]; // A5 C6 E6 A6 C7 E7
+const F_LADDER = [698.46, 880.0, 1046.5, 1396.91, 1760.0, 2093.0];   // F5 A5 C6 F6 A6 C7
+
+export interface ChordInfo {
+  name: 'Am' | 'F';
+  /** 低→高に並んだ構成音（Hz）。SFX側がインデックスで選ぶ。 */
+  ladder: number[];
+}
+
+/**
+ * いま聴こえているコード（小節位置）を返す。BGM停止時は Am をフォールバック。
+ * scheduler の step は先読みで進むため、実時刻から小節位置を算出して取りこぼしを防ぐ。
+ */
+export function getCurrentChord(): ChordInfo {
+  const mb = getMusicBus();
+  if (!running || !mb) return { name: 'Am', ladder: AM_LADDER };
+  const elapsed = mb.ctx.currentTime - seqStartTime;
+  const stepsElapsed = Math.floor(elapsed / SECONDS_PER_STEP);
+  const s = ((stepsElapsed % STEPS) + STEPS) % STEPS;
+  return s < 8 ? { name: 'Am', ladder: AM_LADDER } : { name: 'F', ladder: F_LADDER };
+}
 
 // テープストップ用に「現在鳴っている（またはスケジュール済みの）」オシレーターを追跡する
 const activeNotes = new Set<OscillatorNode>();
@@ -113,6 +139,7 @@ export function startMusic() {
   running = true;
   step = 0;
   nextNoteTime = ctx.currentTime + 0.1;
+  seqStartTime = nextNoteTime;
   // フェードイン
   bus.gain.cancelScheduledValues(ctx.currentTime);
   bus.gain.setValueAtTime(bus.gain.value, ctx.currentTime);

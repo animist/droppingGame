@@ -30,6 +30,8 @@ precision mediump float;
 uniform float time;
 uniform vec2 resolution;
 uniform float progress;
+uniform vec3 zoneCool;  // バイオームの基調色（安全時, progress=0）
+uniform vec3 zoneHot;   // バイオームの終端色（危険時, progress=1）
 
 uniform vec4 ball;        // x, y, radius, rotation
 uniform vec2 ballScale;   // scaleX, scaleY
@@ -49,10 +51,8 @@ uniform vec3 partCol[${MAX_PARTICLES}];// r, g, b
 
 varying vec2 fragCoord;
 
-const vec3 COL_START = vec3(0.102, 0.102, 0.180); // 青紫
-// ピンチ時の終端色。赤すぎてボールが埋もれないよう暗いトーンの深紅にする
-// （shader用の調整値。classicの BG_COLOR_END とは意図的に別）
-const vec3 COL_END   = vec3(0.150, 0.020, 0.060); // 暗い深紅
+// 背景の基調色/終端色は zoneCool/zoneHot uniform で供給（バイオームで切替）。
+// 既定値は青紫→暗い深紅（=従来の COL_START/COL_END 相当, zone0）。
 
 float hash21(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -103,7 +103,7 @@ void main(void) {
   vec2 uv = fragCoord / resolution;            // 0..1（y上）
 
   // ---- 背景 ----
-  vec3 base = mix(COL_START, COL_END, clamp(progress, 0.0, 1.0));
+  vec3 base = mix(zoneCool, zoneHot, clamp(progress, 0.0, 1.0));
   base *= mix(0.90, 1.20, uv.y);
   float neb = sin(uv.x * 4.0 + time * 0.05) * sin(uv.y * 3.0 - time * 0.04);
   base += mix(vec3(0.04, 0.05, 0.10), vec3(0.06, 0.015, 0.03), clamp(progress, 0.0, 1.0))
@@ -208,6 +208,8 @@ export interface ShaderBackground {
   setGap: (g: GapState | null, lineGlowStr: number) => void;
   /** プールを parts/colors バッファへ詰め直し、partCount を更新（毎フレーム） */
   commitParticles: () => void;
+  /** バイオームのパレットを反映（基調色 cool / 終端色 hot, ともに 0xRRGGBB） */
+  setBiome: (cool: number, hot: number) => void;
 }
 
 /**
@@ -218,6 +220,9 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
 
   const base = new Phaser.Display.BaseShader('dropScene', FRAG, undefined, {
     progress: { type: '1f', value: 0 },
+    // 既定 zone0（従来の COL_START / COL_END 相当）
+    zoneCool: { type: '3f', value: rgb(0x1a1a2e) },
+    zoneHot: { type: '3f', value: rgb(0x26050f) },
     ball: { type: '4f', value: { x: GAME.WIDTH / 2, y: GAME.BALL_START_Y, z: GAME.BALL_INITIAL_DIAMETER / 2, w: 0 } },
     ballScale: { type: '2f', value: { x: 1, y: 1 } },
     ballColor: { type: '3f', value: rgb(GAME.BALL_COLOR_START) },
@@ -243,6 +248,10 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
     shader,
     particles,
     commitParticles: () => shader.setUniform('partCount.value', particles.writeBuffers()),
+    setBiome: (cool: number, hot: number) => {
+      shader.setUniform('zoneCool.value', rgb(cool));
+      shader.setUniform('zoneHot.value', rgb(hot));
+    },
     setProgress: (t: number) => shader.setUniform('progress.value', t),
     setPlayfield: (s: PlayfieldState) => {
       shader.setUniform('ball.value', { x: s.x, y: s.y, z: s.radius, w: s.rot });
