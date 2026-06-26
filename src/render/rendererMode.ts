@@ -18,9 +18,10 @@ export function setRendererMode(m: RendererMode): void {
   mode = m;
 }
 
-// ブルーム（PostFX）。全画面マルチパスでモバイル負荷があるため高ティア時のみ適用する。
-// 重い場合は false にして無効化できる。
-let bloom = true;
+// ブルーム（PostFX）。全画面マルチパスで負荷が大きく、ティア推定が「高」でも実機(モバイル)が
+// 耐えられないことがあるため既定OFF。capable端末では setBloomEnabled(true) で opt-in。
+// （SDFの加算グローは常時効くのでOFFでも発光感は残る）
+let bloom = false;
 
 export function isBloomEnabled(): boolean {
   return bloom;

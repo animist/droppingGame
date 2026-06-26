@@ -177,8 +177,9 @@ export class GameScene extends Phaser.Scene {
     // restart で重複追加しないよう先に clear。重い場合は setBloomEnabled(false) で無効化可。
     this.cameras.main.postFX.clear();
     if (this.shaderBg && isBloomEnabled() && getQuality().glow) {
-      // color, offsetX, offsetY, blurStrength, strength, steps（stepsは負荷直結なので控えめ3）
-      this.cameras.main.postFX.addBloom(0xffffff, 1, 1, 1.0, 0.7, 3);
+      // color, offsetX, offsetY, blurStrength, strength, steps
+      // steps はパス数に直結＝負荷直結なので最小の2。強度/ぼかしも控えめに。
+      this.cameras.main.postFX.addBloom(0xffffff, 1, 1, 0.8, 0.6, 2);
     }
 
     // 警告用の赤ビネット（alpha 0 で常駐、警告中だけ脈動）
