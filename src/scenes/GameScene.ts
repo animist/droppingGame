@@ -2,7 +2,7 @@ import Phaser from 'phaser';
 import { GAME, STORAGE_KEYS } from '../config/balance';
 import { FONT_FAMILY } from '../config/ui';
 import { tilt } from '../input/tilt';
-import { playBounce, playWall, playPass, playGameOver, playPerfectPass, playNearMiss, playMilestone, playBestBeaten, setMusicMuffled, updateFallSound, muteFallSound } from '../audio/sfx';
+import { playBounce, playWall, playPass, playGameOver, playPerfectPass, playNearMiss, playMilestone, playBestBeaten, playStreakLost, addChordLayer, collapseChord, setMusicMuffled, updateFallSound, muteFallSound } from '../audio/sfx';
 import { startMusic, stopMusic, tapeStopMusic, setMusicIntensity, intensityFromScore } from '../audio/music';
 import { vibrate } from '../input/haptics';
 import { lerpColor, brighten } from '../util/color';
@@ -42,6 +42,8 @@ export class GameScene extends Phaser.Scene {
   private shaderBg: ShaderBackground | null = null;               // shaderモード時の手続き背景+ボール（classic時はnull）
   private trailVelX = 0;                                          // shaderトレイル用の平滑速度（遅れて追従）。バウンス急反転を吸収
   private trailVelY = 0;
+  private biomeZone = 0;                                          // 現在のバイオーム（スコア帯）。shaderモード時に背景パレットを切替
+  private biomeMix = { t: 0 };                                    // ゾーン遷移tween用プロキシ（多重遷移を避けるため使い回す）
   private ballExploded = false;                                   // 死亡演出でボールを破裂させたか（shader描画を消す）
   private guideTexts: Phaser.GameObjects.Text[] = [];             // 初回プレイの操作ガイド
   private bounceCount = 0;
@@ -113,6 +115,9 @@ export class GameScene extends Phaser.Scene {
     this.isScrolling = false;
     this.pointerLastX = null;
     this.bgProgress = 0;
+    this.biomeZone = 0;
+    this.trailVelX = 0;
+    this.trailVelY = 0;
     this.trailTimer = 0;
     this.ambientTimer = 0;
     this.warningActive = false;
@@ -209,7 +214,7 @@ export class GameScene extends Phaser.Scene {
     setMusicIntensity(0);
     setMusicMuffled(false);
     startMusic();
-    this.events.once('shutdown', () => stopMusic());
+    this.events.once('shutdown', () => { stopMusic(); collapseChord(); });
     this.setupInput();
 
     // 初回プレイ（累計プレイ回数 0）のときだけ操作ガイドを表示
@@ -632,6 +637,7 @@ export class GameScene extends Phaser.Scene {
     if (this.isGameOver || this.isScrolling) return;
 
     this.bounceCount += 1;
+    const lostStreak = this.perfectStreak; // リセット前に保持（喪失演出の判定に使う）
     this.perfectStreak = 0;
     this.ballDiameter += GAME.BALL_GROWTH_PER_BOUNCE;
     const radius = this.ballDiameter / 2;
@@ -653,6 +659,11 @@ export class GameScene extends Phaser.Scene {
     );
     vibrate(Math.min(40, 10 + sizeRatio * 4));
 
+    // 連続が途切れたら積層コードは必ず崩落（B）。視覚＋専用SFXの強い演出は
+    // 大きい連続を失った時だけ（小さな途切れは崩落音だけで控えめに）。
+    if (lostStreak > 0) collapseChord();
+    if (lostStreak >= GAME.STREAK_LOST_MIN) this.triggerStreakLost();
+
     if (this.ballDiameter > this.gapWidth) {
       this.triggerGameOver();
     }
@@ -664,6 +675,81 @@ export class GameScene extends Phaser.Scene {
     if (body.blocked.left || body.blocked.right) {
       playWall(this.ballPan());
     }
+  }
+
+  // スコア帯に応じて背景バイオームを切替（shaderモードのみ）。
+  // 到達した最大ゾーンへ、cool/hot パレットを時間補間で滑らかに遷移させる。
+  private updateBiome() {
+    if (!this.shaderBg) return;
+    let zone = 0;
+    for (let i = 0; i < GAME.BIOMES.length; i++) {
+      if (this.score >= GAME.BIOMES[i].score) zone = i;
+    }
+    if (zone === this.biomeZone) return;
+    const from = GAME.BIOMES[this.biomeZone];
+    const to = GAME.BIOMES[zone];
+    this.biomeZone = zone;
+    // 多重遷移を避けるため共有プロキシをリセットして tween し直す
+    this.tweens.killTweensOf(this.biomeMix);
+    this.biomeMix.t = 0;
+    this.tweens.add({
+      targets: this.biomeMix,
+      t: 1,
+      duration: GAME.BIOME_TRANSITION_MS,
+      ease: 'Sine.easeInOut',
+      onUpdate: () => {
+        const cool = lerpColor(from.cool, to.cool, this.biomeMix.t);
+        const hot = lerpColor(from.hot, to.hot, this.biomeMix.t);
+        this.shaderBg?.setBiome(cool, hot);
+      },
+    });
+  }
+
+  // PERFECT連続が途切れた瞬間の負の余韻: 脱色フラッシュ + "STREAK LOST" + 専用SFX。
+  // ストリークを「失うと痛い資産」に変え、PERFECT継続の動機を強める。
+  private triggerStreakLost() {
+    playStreakLost();
+    vibrate([0, 60, 40, 30]);
+    // 暗いグレーの全画面を一瞬かぶせてフェードアウト（彩度が一拍抜ける感覚）
+    const flash = this.add
+      .rectangle(GAME.WIDTH / 2, GAME.HEIGHT / 2, GAME.WIDTH, GAME.HEIGHT, 0x20222c)
+      .setDepth(940)
+      .setAlpha(GAME.STREAK_LOST_FLASH_ALPHA);
+    this.tweens.add({
+      targets: flash,
+      alpha: 0,
+      duration: GAME.STREAK_LOST_FLASH_MS,
+      ease: 'Quad.easeOut',
+      onComplete: () => flash.destroy(),
+    });
+    const txt = this.add
+      .text(GAME.WIDTH / 2, 540, 'STREAK LOST', {
+        fontFamily: FONT_FAMILY,
+        fontSize: '40px',
+        color: '#9aa0b5',
+        fontStyle: 'bold',
+      })
+      .setOrigin(0.5)
+      .setDepth(941)
+      .setAlpha(0);
+    this.tweens.add({
+      targets: txt,
+      alpha: 0.95,
+      scale: { from: 1.2, to: 1 },
+      duration: 150,
+      ease: 'Back.easeOut',
+      onComplete: () => {
+        this.tweens.add({
+          targets: txt,
+          alpha: 0,
+          y: '-=30',
+          delay: 220,
+          duration: 360,
+          ease: 'Quad.easeIn',
+          onComplete: () => txt.destroy(),
+        });
+      },
+    });
   }
 
   // ボールのx位置 → ステレオパン (-1〜+1)
@@ -938,6 +1024,9 @@ export class GameScene extends Phaser.Scene {
     // マイルストーン到達チェック（1回の通過で複数跨いだ場合は最高位を採用）
     this.checkMilestones(prevScore, this.score);
 
+    // バイオーム（背景パレット）をスコア帯に応じて切替（shaderモードのみ）
+    this.updateBiome();
+
     // 自己ベスト超えチェック（初回プレイ=ベスト0のときは Result の NEW BEST に任せる）
     if (!this.bestBeaten && this.prevBest > 0 && this.score > this.prevBest) {
       this.triggerBestBeaten();
@@ -956,7 +1045,8 @@ export class GameScene extends Phaser.Scene {
     const pan = this.ballPan();
     if (isPerfect) {
       this.spawnPerfectText(this.perfectStreak);
-      playPerfectPass(this.perfectStreak * GAME.FALL_STREAK_PITCH_CENTS, pan);
+      playPerfectPass(this.perfectStreak, pan);
+      addChordLayer(this.perfectStreak); // PERFECTごとに持続コードを1声積む（B）
       vibrate([0, 40, 30, 40, 30, 60]);
     } else {
       playPass(pan);
@@ -1606,6 +1696,7 @@ export class GameScene extends Phaser.Scene {
     this.stopWarning();
     this.dismissGuide();
     muteFallSound();
+    collapseChord(); // 積層コードが残っていれば崩落（B）
     tapeStopMusic(); // BGMはピッチが落ちながら止まる（テープストップ）
     const body = this.ball.body as Phaser.Physics.Arcade.Body | null;
     if (body) {

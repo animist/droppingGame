@@ -210,6 +210,12 @@ export function playPass(pan = 0) {
   setTimeout(() => tone({ freq: 1760, duration: 0.16, type: 'triangle', volume: 0.2, pan }), 110);
 }
 
+// PERFECT連続が途切れた瞬間の負の余韻（短い鈍い下降）。ゲームオーバーより軽く、通過より暗く。
+export function playStreakLost() {
+  tone({ freq: 440, freqEnd: 392, duration: 0.12, type: 'sawtooth', volume: 0.13 });
+  setTimeout(() => tone({ freq: 294, freqEnd: 233, duration: 0.28, type: 'triangle', volume: 0.16 }), 90);
+}
+
 // ニアミス: 鋭い上向きの「ヒュッ」という緊張感のある音
 export function playNearMiss(pan = 0) {
   tone({ freq: 600, freqEnd: 1500, duration: 0.16, type: 'sawtooth', volume: 0.16, pan });
@@ -283,12 +289,247 @@ export function playGameOverE() {
   tone({ freq: 370, duration: 0.70, type: 'triangle', volume: 0.18 });
 }
 
-export function playPerfectPass(streakCents = 0, pan = 0) {
-  const mult = Math.pow(2, streakCents / 1200);
-  tone({ freq: 1175 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan });
-  setTimeout(() => tone({ freq: 1568 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan }), 50);
-  setTimeout(() => tone({ freq: 1976 * mult, duration: 0.1, type: 'triangle', volume: 0.22, pan }), 100);
-  setTimeout(() => tone({ freq: 2349 * mult, duration: 0.22, type: 'triangle', volume: 0.22, pan }), 150);
+// PERFECT通過（アイデアA「ドレミ階段」/ 周回オクターブ上げ版）。
+// Cメジャー(=Aナチュラルマイナー)のドレミファソラシドを、PERFECT連続1回につき1段ずつ登る。
+// 1オクターブ登り切ったら次は1オクターブ上で再びドレミファ…と繰り返す（＝連続が伸びるほど
+// どんどん高いキーへ）。耳保護のため上限オクターブで頭打ち。途切れれば streak=1 で最下段に戻る。
+// C major は BGM(Am→F) と同じ音集合なので在keyのまま溶ける。
+const A_SCALE = [
+  523.25,  // C5
+  587.33,  // D5
+  659.25,  // E5
+  698.46,  // F5
+  783.99,  // G5
+  880.0,   // A5
+  987.77,  // B5
+];
+const A_SCALE_MAX_OCTAVE = 2; // 周回の上限（+2オクターブ＝最高でB7付近。これ以上は上げない）
+
+// step（0始まり）→ 音階＋周回オクターブ の周波数
+function aScaleFreq(step: number): number {
+  const n = A_SCALE.length;
+  const octave = Math.min(A_SCALE_MAX_OCTAVE, Math.floor(step / n));
+  return A_SCALE[step % n] * Math.pow(2, octave);
+}
+
+export function playPerfectPass(streak = 1, pan = 0) {
+  const step = Math.max(0, streak - 1);
+  const lead = aScaleFreq(step);
+  const below = aScaleFreq(Math.max(0, step - 1)); // 一つ下の段（オクターブ跨ぎも自然に追従）
+  // 一段下→リード音への短い登り。音量はかなり控えめ。
+  tone({ freq: below, duration: 0.06, type: 'triangle', volume: 0.045, pan });
+  setTimeout(() => tone({ freq: lead, duration: 0.22, type: 'triangle', volume: 0.10, pan }), 55);
+}
+
+// === アイデアB: PERFECT連続で積み上がる持続コード（パッド） ===
+// PERFECTごとに1声を低→高へ積み、鳴らし続ける＝チェーンが分厚い和音に育つ。
+// streakが途切れると collapseChord() でピッチを落としながら崩落＝「育てて失う」を音で体現。
+// メロSE(A, 高域C6〜)の“下”を埋める低めの帯域に置き、両者がぶつからないようにする。
+//
+// 2周目以降（lap>=1）は単なる音量増ではなく“質”が変わる（専用バス chordBus 経由）:
+//  ① ローパスのカットオフが周回ごとに上がる＝暗い土台→明るく開けていく
+//  ② フィルタを揺らすLFOの深さが周回ごとに増す＝静的ドローン→うねり/きらめき
+//  ③ 周回ごとにオクターブ上の薄い“空気”の声を1枚足す＝上へ広がる艶・高さ
+interface ChordVoice { osc: OscillatorNode; gain: GainNode; }
+
+// 低→高の積層音（Aマイナーペンタの土台）。1周=この本数。周回ごとにスウェルさせる。
+const CHORD_STACK = [
+  220.0,   // A3（土台ドローン）
+  329.63,  // E4
+  440.0,   // A4
+  523.25,  // C5
+  587.33,  // D5
+  659.25,  // E5
+  783.99,  // G5
+  880.0,   // A5
+];
+// 各音の音量。ピッチは上げず（同じ和音のまま）、周回ごとに音量だけを加算して育てる。
+const CHORD_VOICE_GAIN_BASE = 0.01;    // 1周目の各音の音量
+const CHORD_VOICE_GAIN_LAP = 0.00375;  // 周回ごとに各音へ加える増分
+const CHORD_VOICE_GAIN_MAX = 0.026;    // 各音の上限
+
+// ① フィルタ（明るさ）: lap0=暗め、周回ごとにカットオフ上昇＝開いていく
+const CHORD_FILTER_BASE_HZ = 1200;     // lap0のカットオフ
+const CHORD_FILTER_PER_LAP_HZ = 900;   // 周回ごとにカットオフを上げる量
+const CHORD_FILTER_MAX_HZ = 6000;
+// ② うねり: lap0=なし。2周目(lap>=1)からはライン通過1回ごとに wobble(0→1) を少しずつ上げ、
+//    A=トレモロ（音量うねり, 主軸）と B=ビブラート（ピッチ微揺れ, 僅か）の深さを連動させる。
+//    ※以前はフィルタのカットオフを揺らしていたが、①でカットオフが音域より上に開くと
+//      ほぼ無効化されて聞こえなかったため、確実に聞こえる音量/ピッチ変調に変更。
+const CHORD_WOBBLE_STEP = 0.05;        // 通過1回ごとの wobble 増分（0→1）
+const CHORD_TREMOLO_RATE_HZ = 0.9;     // A: 音量うねりの速さ
+const CHORD_TREMOLO_MAX_DEPTH = 0.5;   // A: 最大の揺れ幅（バス音量を 1±この値 で脈動）
+const CHORD_VIBRATO_RATE_HZ = 0.4;     // B: ピッチ揺れの速さ（トレモロと少しずらす）
+const CHORD_VIBRATO_MAX_CENTS = 12;    // B: 最大のピッチ揺れ（僅か）
+// ③ オクターブ空気: 周回ごとに高域へ薄い声を1枚追加（lap1,2,3 の周波数）
+const CHORD_AIR_GAIN = 0.012;
+const CHORD_AIR_FREQS = [1318.51, 1760.0, 2637.02]; // E6 / A6 / E7
+
+// index = CHORD_STACK の位置。周回で同じ位置を再訪して音量を上げる。
+const chordSlots: (ChordVoice | null)[] = new Array(CHORD_STACK.length).fill(null);
+let airVoices: ChordVoice[] = [];      // ③ 周回ごとに足す空気の声
+let chordMaxLap = 0;                    // 現ストリークで到達した最大lap（質の変化の段数）
+let chordWobble = 0;                    // ② うねりの進行度(0→1)。2周目以降は通過ごとに加算
+
+// Bの専用バス: 全声 → chordBus → chordFilter(lowpass) → master。
+// うねりは A:トレモロ（tremoloLfo→tremoloDepth→chordBus.gain）と
+//          B:ビブラート（vibratoLfo→vibratoDepth→各声の detune）で出す。
+let chordBus: GainNode | null = null;
+let chordFilter: BiquadFilterNode | null = null;
+let tremoloLfo: OscillatorNode | null = null;
+let tremoloDepth: GainNode | null = null;
+let vibratoLfo: OscillatorNode | null = null;
+let vibratoDepth: GainNode | null = null;
+
+function ensureChordBus() {
+  if (!ctx || !masterGain || chordBus) return;
+  chordBus = ctx.createGain();
+  chordBus.gain.value = 1;
+  chordFilter = ctx.createBiquadFilter();
+  chordFilter.type = 'lowpass';
+  chordFilter.frequency.value = CHORD_FILTER_BASE_HZ;
+  chordFilter.Q.value = 0.7;
+  chordBus.connect(chordFilter);
+  chordFilter.connect(masterGain);
+  // A: トレモロ＝バス音量を 1±depth で脈動（depth は wobble に連動。lap0は0＝静止）
+  tremoloLfo = ctx.createOscillator();
+  tremoloLfo.type = 'sine';
+  tremoloLfo.frequency.value = CHORD_TREMOLO_RATE_HZ;
+  tremoloDepth = ctx.createGain();
+  tremoloDepth.gain.value = 0;
+  tremoloLfo.connect(tremoloDepth);
+  tremoloDepth.connect(chordBus.gain);
+  tremoloLfo.start();
+  // B: ビブラート＝各声の detune を ±cents で揺らす（声生成時に detune へ接続）
+  vibratoLfo = ctx.createOscillator();
+  vibratoLfo.type = 'sine';
+  vibratoLfo.frequency.value = CHORD_VIBRATO_RATE_HZ;
+  vibratoDepth = ctx.createGain();
+  vibratoDepth.gain.value = 0;
+  vibratoLfo.connect(vibratoDepth);
+  vibratoLfo.start();
+}
+
+// 新しいlapに入った時だけ呼ぶ。①フィルタ開く ③空気の声を1枚足す。
+// （②うねりは周回単位ではなく通過ごとに増やすので addChordLayer 側で処理する）
+function applyChordLapState(lap: number, now: number) {
+  if (chordFilter) {
+    const cutoff = Math.min(CHORD_FILTER_MAX_HZ, CHORD_FILTER_BASE_HZ + lap * CHORD_FILTER_PER_LAP_HZ);
+    chordFilter.frequency.setTargetAtTime(cutoff, now, 0.4);
+  }
+  // ③ この周回のオクターブ空気を1枚（lap1,2,3 まで）。バス経由＝フィルタ/揺らぎを共有。
+  if (ctx && chordBus && lap >= 1 && lap <= CHORD_AIR_FREQS.length) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(CHORD_AIR_FREQS[lap - 1], now);
+    if (vibratoDepth) vibratoDepth.connect(osc.detune); // B: ビブラートを共有
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(CHORD_AIR_GAIN, now + 0.5);
+    osc.connect(gain);
+    gain.connect(chordBus);
+    osc.start(now);
+    airVoices.push({ osc, gain });
+  }
+}
+
+// PERFECT連続数に応じて積む/育てる。pos=周回内の位置, lap=周回数(0始まり)。
+export function addChordLayer(streak: number) {
+  if (!ctx || !masterGain) return;
+  if (ctx.state !== 'running') { tryResume(); return; }
+  if (streak < 1) return;
+  ensureChordBus();
+  if (!chordBus) return;
+  const n = CHORD_STACK.length;
+  const pos = (streak - 1) % n;
+  const lap = Math.floor((streak - 1) / n);
+  const now = ctx.currentTime;
+  const target = Math.min(CHORD_VOICE_GAIN_MAX, CHORD_VOICE_GAIN_BASE + lap * CHORD_VOICE_GAIN_LAP);
+  const v = chordSlots[pos];
+  if (!v) {
+    // 新規声: 0 から目標音量へクリーンにフェードイン。
+    // ※ここで cancelScheduledValues+setValueAtTime(value) をやると、未処理の
+    //   setValueAtTime(0) がキャンセルされ value=デフォルト1.0 にピン留めされて
+    //   「1.0→目標」の下降ブリップが鳴る（過去のバグ）。新規声では絶対にやらない。
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(CHORD_STACK[pos], now);
+    osc.detune.setValueAtTime((Math.random() * 2 - 1) * 6, now); // わずかな広がり
+    if (vibratoDepth) vibratoDepth.connect(osc.detune); // B: ビブラート（detuneに加算）
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(target, now + 0.2);
+    osc.connect(gain);
+    gain.connect(chordBus);
+    osc.start(now);
+    chordSlots[pos] = { osc, gain };
+  } else {
+    // 既存声: 現在の実値から目標へ再ターゲット（2周目以降の音量スウェル）
+    v.gain.gain.cancelScheduledValues(now);
+    v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+    v.gain.gain.linearRampToValueAtTime(target, now + 0.2);
+  }
+  // 新しいlapに入ったら“質”を一段進める（①フィルタ開く・③空気を1枚追加）
+  if (lap > chordMaxLap) {
+    chordMaxLap = lap;
+    applyChordLapState(lap, now);
+  }
+  // ② 2周目(lap>=1)以降は、ライン通過1回ごとに wobble を少しずつ上げ、
+  //    A=トレモロ（主軸）と B=ビブラート（僅か）の深さを連動して深める。
+  if (lap >= 1) {
+    chordWobble = Math.min(1, chordWobble + CHORD_WOBBLE_STEP);
+    if (tremoloDepth) {
+      tremoloDepth.gain.setTargetAtTime(chordWobble * CHORD_TREMOLO_MAX_DEPTH, now, 0.3);
+    }
+    if (vibratoDepth) {
+      vibratoDepth.gain.setTargetAtTime(chordWobble * CHORD_VIBRATO_MAX_CENTS, now, 0.3);
+    }
+  }
+}
+
+// 積み上げたコードを崩す（streak途切れ／ゲームオーバー時）。ピッチを落としながら消す。
+// バスの質（フィルタ/揺らぎ）も lap0 相当へ戻す。
+export function collapseChord() {
+  chordMaxLap = 0;
+  chordWobble = 0;
+  if (!ctx) {
+    chordSlots.fill(null);
+    airVoices = [];
+    return;
+  }
+  const now = ctx.currentTime;
+  const fade = (v: ChordVoice) => {
+    try {
+      v.gain.gain.cancelScheduledValues(now);
+      v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+      v.gain.gain.linearRampToValueAtTime(0, now + 0.3);
+      v.osc.detune.cancelScheduledValues(now);
+      v.osc.detune.linearRampToValueAtTime(-700, now + 0.3); // 崩れる感じに下げる
+      v.osc.stop(now + 0.34);
+    } catch {
+      // 既に停止済みのノードは無視
+    }
+  };
+  for (let i = 0; i < chordSlots.length; i++) {
+    const v = chordSlots[i];
+    if (v) fade(v);
+    chordSlots[i] = null;
+  }
+  for (const v of airVoices) fade(v);
+  airVoices = [];
+  // バスを暗い静止状態（lap0相当）へ戻す: フィルタを閉じ、うねり(トレモロ/ビブラート)を0に
+  if (chordFilter) {
+    chordFilter.frequency.cancelScheduledValues(now);
+    chordFilter.frequency.setTargetAtTime(CHORD_FILTER_BASE_HZ, now, 0.2);
+  }
+  if (tremoloDepth) {
+    tremoloDepth.gain.cancelScheduledValues(now);
+    tremoloDepth.gain.setTargetAtTime(0, now, 0.2);
+  }
+  if (vibratoDepth) {
+    vibratoDepth.gain.cancelScheduledValues(now);
+    vibratoDepth.gain.setTargetAtTime(0, now, 0.2);
+  }
 }
 
 let fallOsc: OscillatorNode | null = null;
