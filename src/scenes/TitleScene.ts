@@ -4,6 +4,7 @@ import { FONT_FAMILY } from '../config/ui';
 import { enableTilt } from '../input/tilt';
 import { unlockAudio } from '../audio/sfx';
 import { addBackgroundShade } from '../util/bgShade';
+import { setDebugMode } from '../config/debug';
 
 export class TitleScene extends Phaser.Scene {
   constructor() {
@@ -14,18 +15,28 @@ export class TitleScene extends Phaser.Scene {
     const cx = GAME.WIDTH / 2;
     const cy = GAME.HEIGHT / 2;
 
+    // タイトルに入るたびにデバッグモードは解除（通常プレイから始める）
+    setDebugMode(false);
+
     addBackgroundShade(this, -3);
     this.createDemoBall();
 
     // 背景。タップ受付は canvas のネイティブリスナー側で行う（iOS許可要求のジェスチャ維持のため）
     this.add.rectangle(cx, cy, GAME.WIDTH, GAME.HEIGHT).setDepth(-2);
 
-    this.add.text(cx, cy - 240, 'DROPPING', {
+    const title = this.add.text(cx, cy - 240, 'DROPPING', {
       fontFamily: FONT_FAMILY,
       fontSize: '110px',
       color: '#aaaaff',
       fontStyle: '800',
     }).setOrigin(0.5);
+
+    // 隠しデバッグ起動用: タイトルロゴが何回タップされたかを表示する小さなインジケータ
+    const debugHint = this.add.text(cx, cy - 160, '', {
+      fontFamily: FONT_FAMILY,
+      fontSize: '24px',
+      color: '#ff6b6b',
+    }).setOrigin(0.5).setAlpha(0.7);
 
     const highScore = Number(localStorage.getItem(STORAGE_KEYS.HIGH_SCORE) ?? 0);
     this.add.text(cx, cy - 20, `BEST  ${highScore}`, {
@@ -63,8 +74,38 @@ export class TitleScene extends Phaser.Scene {
     // ため、canvas に直接ネイティブリスナーを張って enableTilt() を同期呼び出しする。
     const canvas = this.game.canvas;
     let started = false;
-    const onTap = () => {
+    let debugTaps = 0;
+    let lastTapTs = -1;
+    const onTap = (ev: Event) => {
       if (started) return;
+      // pointerup と touchend が同一タップで二重発火するのを間引く
+      if (ev.timeStamp - lastTapTs < 60) return;
+      lastTapTs = ev.timeStamp;
+
+      // 隠しデバッグ: タイトルロゴを規定回数タップで debug ON。
+      // タッチ座標をゲーム座標へ変換し、ロゴ矩形内なら「開始せず」カウントする。
+      const p = ev as PointerEvent;
+      const t = ev as TouchEvent;
+      const cx2 = p.clientX !== undefined ? p.clientX : t.changedTouches?.[0]?.clientX;
+      const cy2 = p.clientX !== undefined ? p.clientY : t.changedTouches?.[0]?.clientY;
+      if (cx2 !== undefined && cy2 !== undefined) {
+        const rect = canvas.getBoundingClientRect();
+        const gx = ((cx2 - rect.left) / rect.width) * GAME.WIDTH;
+        const gy = ((cy2 - rect.top) / rect.height) * GAME.HEIGHT;
+        if (Phaser.Geom.Rectangle.Contains(title.getBounds(), gx, gy)) {
+          debugTaps += 1;
+          if (debugTaps < GAME.DEBUG_TAP_COUNT) {
+            // あと少しになったら残りタップ数をうっすら表示（誤爆時は何も起きない）
+            if (debugTaps >= GAME.DEBUG_TAP_COUNT - 4) {
+              debugHint.setText(`DEBUG… ${GAME.DEBUG_TAP_COUNT - debugTaps}`);
+            }
+            return; // ロゴ連打中はゲーム開始しない
+          }
+          setDebugMode(true);
+          debugHint.setText('DEBUG MODE');
+        }
+      }
+
       started = true;
       canvas.removeEventListener('pointerup', onTap);
       canvas.removeEventListener('touchend', onTap);

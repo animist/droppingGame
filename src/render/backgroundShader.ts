@@ -152,15 +152,41 @@ void main(void) {
   float glow = exp(-max(dBall, 0.0) * 0.05) * ballGlowStr;
   col += ballGlowColor * glow;
 
-  // ボール本体（約3pxのAAで縁をなめらかに）
-  float ballMask = 1.0 - smoothstep(-1.5, 1.5, dBall);
-  col = mix(col, ballColor, ballMask);
+  // ---- ボール本体（艶のある3D球として陰影付け）----
+  float ballMask = 1.0 - smoothstep(-1.5, 1.5, dBall); // 約3pxのAA
 
-  // 左上の白ハイライト（球体感）。ボール内側にのみ乗せる
-  vec2 hp = bc + vec2(-0.30 * br, -0.30 * br);
-  float dh = length(P - hp) - br * 0.30;
-  float hl = (1.0 - smoothstep(-1.0, 1.0, dh)) * ballMask * 0.45;
-  col += vec3(1.0) * hl;
+  // 画面固定の擬似法線（回転で光が回らないよう、q ではなく画面オフセットで算出）
+  vec2 sd = (P - bc) / max(br, 0.001);
+  float r2 = clamp(1.0 - dot(sd, sd), 0.0, 1.0);
+  float zz = sqrt(r2);
+  vec3 N = normalize(vec3(sd, zz + 0.001));
+  // 光源は左上から。速度でわずかに傾けて“光が動く”艶を出す
+  vec2 ldir = vec2(-0.55, -0.55) + clamp(ballVel * 0.0006, -0.25, 0.25);
+  vec3 L = normalize(vec3(ldir, 0.75));
+
+  // ① 内側の陰影グラデ（左上明・右下暗）で立体感
+  float diff = clamp(dot(N, L), 0.0, 1.0);
+  vec3 body = ballColor * (0.5 + 0.65 * diff);
+
+  // ② 鋭い鏡面ハイライト（濡れ/ガラス感）
+  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
+  float spec = pow(clamp(dot(N, H), 0.0, 1.0), 48.0);
+  body += vec3(1.0) * spec * 0.9;
+
+  // ③ フレネルのリムライト（縁を寒色で淵取り発光）
+  float fres = pow(1.0 - zz, 3.0);
+  body += vec3(0.55, 0.70, 1.0) * fres * 0.45;
+
+  // ④ アニメするシーン（表面をゆっくり横切る光の帯）
+  float band = sin((sd.x - sd.y) * 3.2 - time * 1.6);
+  float sheen = smoothstep(0.80, 1.0, band) * r2;
+  body += vec3(1.0) * sheen * 0.14;
+
+  // ⑤ 終端色での虹彩（progressが高い＝危険なほど縁が虹色に揺らめく）
+  vec3 iridCol = 0.5 + 0.5 * cos(vec3(0.0, 2.094, 4.188) + (sd.x + sd.y) * 4.0 + time * 2.0);
+  body += iridCol * (fres * clamp(progress, 0.0, 1.0) * 0.5);
+
+  col = mix(col, body, ballMask);
 
   // ---- ライン/マーカー（ボールの手前に重ねる＝classic相当）----
   drawGap(col, P, gap, gapColor, lineGlowStr);

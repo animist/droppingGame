@@ -10,6 +10,7 @@ import { addBackgroundShade, addWarningVignette } from '../util/bgShade';
 import { getQuality } from '../config/quality';
 import { enableWakeLock, disableWakeLock } from '../util/wakelock';
 import { getRendererMode, isBloomEnabled } from '../render/rendererMode';
+import { getDebugMode } from '../config/debug';
 import { addShaderBackground, ShaderBackground } from '../render/backgroundShader';
 
 export class GameScene extends Phaser.Scene {
@@ -22,6 +23,7 @@ export class GameScene extends Phaser.Scene {
 
   private gapBase = GAME.GAP_INITIAL;   // 決定論的な基準隙間幅（単調に縮む。難易度カーブの本体）
   private gapWidth = GAME.GAP_INITIAL;   // 表示/判定用の実効隙間幅（基準幅±ジッタ）
+  private debug = false;                 // デバッグモード（穴広い/縮まない/スコア保存しない）
   private stageCount = 0;                // 通過したステージ数（息継ぎリズムの判定に使う）
   private isBreather = false;            // 現在のステージが「広い息継ぎ」か（ライン色の合図に使う）
   private gapCenterX = GAME.WIDTH / 2;
@@ -55,6 +57,10 @@ export class GameScene extends Phaser.Scene {
   private bestBeaten = false;        // ベスト超え演出を発動済みか
   private gammaRest = 0;        // 持ち方の傾き癖を吸収するための中立値
   private gammaCalibrated = false;
+  private calibAnchorMs = -1;   // キャリブ開始の基準時刻（最初のupdate時刻）。-1=未設定
+  private calibWindowStart = -1;// 平均窓の開始時刻。-1=窓未開始
+  private calibSum = 0;         // 平均窓のgamma合計
+  private calibCount = 0;       // 平均窓のサンプル数
   // グローは全画面 postFX ではなく、焼いた放射グラデを加算ブレンドした Image で表現する
   // （postFX は全画面パスでフィルレートを最も食うため）。strength は alpha にマップ。
   private ballGlow: Phaser.GameObjects.Image | null = null;
@@ -103,8 +109,11 @@ export class GameScene extends Phaser.Scene {
   }
 
   create() {
-    this.gapBase = GAME.GAP_INITIAL;
-    this.gapWidth = GAME.GAP_INITIAL; // 初回ステージはジッタ無しで素直に開始
+    this.debug = getDebugMode();
+    // debug時は初期穴を広く（死ににくくして音/演出のテストに集中できる）
+    const initGap = this.debug ? GAME.GAP_INITIAL * GAME.DEBUG_GAP_MULT : GAME.GAP_INITIAL;
+    this.gapBase = initGap;
+    this.gapWidth = initGap; // 初回ステージはジッタ無しで素直に開始
     this.stageCount = 0;
     this.isBreather = false;
     this.gapCenterX = GAME.WIDTH / 2;
@@ -138,6 +147,10 @@ export class GameScene extends Phaser.Scene {
     }
     this.gammaRest = 0;
     this.gammaCalibrated = false;
+    this.calibAnchorMs = -1;
+    this.calibWindowStart = -1;
+    this.calibSum = 0;
+    this.calibCount = 0;
     this.ballGlow = null;
     this.ballExploded = false;
     this.lineGlows = [];
@@ -151,11 +164,8 @@ export class GameScene extends Phaser.Scene {
     this.time.timeScale = 1;
     this.tweens.timeScale = 1;
     if (this.physics.world) this.physics.world.timeScale = 1;
-    // 200ms 後に傾きセンサーの現在値を「中立」として記録（端末を構える角度の癖を吸収）
-    this.time.delayedCall(200, () => {
-      if (tilt.enabled) this.gammaRest = tilt.value;
-      this.gammaCalibrated = true;
-    });
+    // 中立キャリブレーションは update() の updateTiltCalibration() で行う:
+    //  最初の傾きイベント受信を待ち（中立0事故の防止）、落ち着き待ち後に短い窓で平均して中立を決める。
     this.cameras.main.setBackgroundColor(GAME.BG_COLOR_START);
 
     this.createParticles(); // 円テクスチャの生成を含むので先に呼ぶ（パララックスが使う）
@@ -198,6 +208,16 @@ export class GameScene extends Phaser.Scene {
       color: '#ffffff',
       fontStyle: 'bold',
     }).setOrigin(0.5).setAlpha(0.5);
+
+    // デバッグモードの表示（左上に常駐）。穴広い/縮まない/スコア保存なし、の状態を明示。
+    if (this.debug) {
+      this.add.text(16, 16, 'DEBUG', {
+        fontFamily: FONT_FAMILY,
+        fontSize: '28px',
+        color: '#ff6b6b',
+        fontStyle: 'bold',
+      }).setOrigin(0, 0).setAlpha(0.85).setDepth(980);
+    }
 
     this.physics.world.setBoundsCollision(true, true, false, false);
     this.createBall();
@@ -452,6 +472,32 @@ export class GameScene extends Phaser.Scene {
   }
 
   // 泡の位置と色を現在の傾き(中立からのズレ)に合わせて更新する。
+  // 中立キャリブレーション: 最初の傾きイベント受信を待ち（中立0事故防止）、落ち着き待ち後に
+  // 短い窓で gamma を平均して中立値(gammaRest)を決める。完了まで毎フレーム呼ばれる。
+  // time は update の _time（実時間ベース、timeScale非依存）を使う。
+  private updateTiltCalibration(time: number) {
+    if (this.gammaCalibrated) return;
+    // スワイプ運用（傾き無効）なら即完了扱い（gammaRest=0のまま。傾き入力は使われない）
+    if (!tilt.enabled) { this.gammaCalibrated = true; return; }
+    if (this.calibAnchorMs < 0) this.calibAnchorMs = time;
+    // 開始直後の手ブレが収まるまで待つ（C）
+    if (time - this.calibAnchorMs < GAME.TILT_CALIB_SETTLE_MS) return;
+    // 最初の傾きイベントを受信するまで待つ（B: 未着のまま中立0で確定する事故を防ぐ）
+    if (!tilt.hasReading) return;
+    // 平均窓（A: 単発値の偏りを消す）
+    if (this.calibWindowStart < 0) {
+      this.calibWindowStart = time;
+      this.calibSum = 0;
+      this.calibCount = 0;
+    }
+    this.calibSum += tilt.value;
+    this.calibCount += 1;
+    if (time - this.calibWindowStart >= GAME.TILT_CALIB_WINDOW_MS) {
+      this.gammaRest = this.calibCount > 0 ? this.calibSum / this.calibCount : tilt.value;
+      this.gammaCalibrated = true;
+    }
+  }
+
   private updateTiltIndicator() {
     const ind = this.tiltIndicator;
     if (!ind || !this.tiltBubble) return;
@@ -621,7 +667,9 @@ export class GameScene extends Phaser.Scene {
       return Phaser.Math.Clamp(this.gapBase * GAME.BREATHER_GAP_MULT, floor, maxGap);
     }
     const jitter = Phaser.Math.Between(-GAME.GAP_JITTER_PX, GAME.GAP_JITTER_PX);
-    return Phaser.Math.Clamp(this.gapBase + jitter, floor, GAME.GAP_INITIAL);
+    // debug時は広い穴を許すため、頭打ちを GAP_INITIAL ではなく幾何学上限まで上げる
+    const maxGap = this.debug ? GAME.WIDTH - 2 * GAME.LINE_SEGMENT_MIN_WIDTH : GAME.GAP_INITIAL;
+    return Phaser.Math.Clamp(this.gapBase + jitter, floor, maxGap);
   }
 
   // 現在のステージのライン/マーカーの基準色（息継ぎ時は緑＝安全の合図）。
@@ -812,6 +860,9 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(_time: number, delta: number) {
+    // 傾きの中立キャリブレーション（凍結等より前に、完了まで毎フレーム進める）
+    this.updateTiltCalibration(_time);
+
     // ニアミスのピボット固定ズームは凍結中も毎フレーム駆動する（カメラだけ動かす）
     if (this.nmActive) this.updateNearMissZoom(delta);
 
@@ -1104,10 +1155,15 @@ export class GameScene extends Phaser.Scene {
       onComplete: () => {
         this.stageCount += 1;
         // 基準幅を単調に縮め（難易度カーブ本体）、実効幅はそこに非累積ジッタ/息継ぎを乗せる
-        this.gapBase = Math.max(
-          this.ballDiameter + GAME.GAP_MIN_MARGIN,
-          this.gapBase - GAME.GAP_REDUCTION,
-        );
+        // debug時は縮めない（穴サイズ一定で延々テストできる）。ただし floor は守る。
+        if (!this.debug) {
+          this.gapBase = Math.max(
+            this.ballDiameter + GAME.GAP_MIN_MARGIN,
+            this.gapBase - GAME.GAP_REDUCTION,
+          );
+        } else {
+          this.gapBase = Math.max(this.ballDiameter + GAME.GAP_MIN_MARGIN, this.gapBase);
+        }
         this.gapWidth = this.computeEffectiveGap();
         this.updateBgColor();
         this.updateBallColor(); // 穴が縮んで比率が変わったのでボール色も更新
@@ -1704,15 +1760,18 @@ export class GameScene extends Phaser.Scene {
       body.enable = false;
     }
 
-    try {
-      const prevBest = Number(localStorage.getItem(STORAGE_KEYS.HIGH_SCORE) ?? 0);
-      if (this.score > prevBest) {
-        localStorage.setItem(STORAGE_KEYS.HIGH_SCORE, this.score.toString());
+    // debug時はハイスコア/プレイ回数を一切保存しない（記録を汚さない）
+    if (!this.debug) {
+      try {
+        const prevBest = Number(localStorage.getItem(STORAGE_KEYS.HIGH_SCORE) ?? 0);
+        if (this.score > prevBest) {
+          localStorage.setItem(STORAGE_KEYS.HIGH_SCORE, this.score.toString());
+        }
+        const playCount = Number(localStorage.getItem(STORAGE_KEYS.PLAY_COUNT) ?? 0) + 1;
+        localStorage.setItem(STORAGE_KEYS.PLAY_COUNT, playCount.toString());
+      } catch {
+        // localStorage may be unavailable (private mode, etc.) — skip persistence
       }
-      const playCount = Number(localStorage.getItem(STORAGE_KEYS.PLAY_COUNT) ?? 0) + 1;
-      localStorage.setItem(STORAGE_KEYS.PLAY_COUNT, playCount.toString());
-    } catch {
-      // localStorage may be unavailable (private mode, etc.) — skip persistence
     }
 
     // --- 死の演出 ---
