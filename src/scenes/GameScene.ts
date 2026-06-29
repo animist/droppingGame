@@ -955,6 +955,9 @@ export class GameScene extends Phaser.Scene {
       // ゲームオーバー/スクロール中も飛散を継続させるため、この return より前で更新する。
       this.shaderBg.particles.update(delta);
       this.shaderBg.commitParticles();
+      // 周回パーティクルの本数＝このランの最大コンボ（9で頭打ち、途切れても減らず、
+      // ゲームオーバーで maxPerfectStreak が 0 に戻ることでリセット）。
+      this.shaderBg.setOrbitCount(this.maxPerfectStreak);
     }
 
     if (this.isGameOver || this.isScrolling || !body) return;

@@ -49,6 +49,8 @@ uniform int partCount;                 // 有効粒数（これ以降はbreakで
 uniform vec4 parts[${MAX_PARTICLES}];  // x, y, radius(px), alpha
 uniform vec3 partCol[${MAX_PARTICLES}];// r, g, b
 
+uniform int orbitCount;                // ボール周回パーティクルの本数（0〜9, このランの最大コンボ）
+
 varying vec2 fragCoord;
 
 // 背景の基調色/終端色は zoneCool/zoneHot uniform で供給（バイオームで切替）。
@@ -78,6 +80,21 @@ float starLayer(vec2 uv, float scale, float speed, float density) {
 float sdBox(vec2 p, vec2 b) {
   vec2 d = abs(p) - b;
   return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+}
+
+// RGB<->HSV（補色＝色相+0.5 を作るのに使う）
+vec3 rgb2hsv(vec3 c) {
+  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+  vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+  float d = q.x - min(q.w, q.y);
+  float e = 1.0e-10;
+  return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
 
 // 隙間（左右バー + 端マーカー + グロー）を col に合成。alpha=0 なら描かない。
@@ -150,7 +167,60 @@ void main(void) {
 
   // グロー（ボールの背後・加算）
   float glow = exp(-max(dBall, 0.0) * 0.05) * ballGlowStr;
+
+  // ---- ボールを周回する微粒子（傾いた同心円軌道・軌跡付き・立体）----
+  // 軌道面を楕円(y圧縮 cphi)＋ゆっくり歳差(psi)させ、3D的に見せる。各リングで奥行き z∝sin(角度)
+  // を判定し、奥(z<0)は orbitBack に、手前(z>0)は orbitFront に分けて貯める。
+  // orbitBack はボール本体合成より前に足す→球と重なる所は隠れる＝奥行き（立体）になる。
+  vec3 orbitBack = vec3(0.0);
+  vec3 orbitFront = vec3(0.0);
+  if (br > 1.0) {
+    vec2 rel = P - bc;
+    // ボール色の補色（色相環で反対）を鮮やかに。同系色だと球と重なって見づらいため。
+    vec3 bh = rgb2hsv(ballColor);
+    float baseHue = fract(bh.x + 0.5);
+    // 本数は orbitCount（このランの最大コンボ, 0〜9）。内側から順に増える。
+    for (int i = 0; i < 9; i++) {
+      if (i >= orbitCount) break;
+      float fi = float(i);
+      float orad = br + 16.0 + fi * 3.0;                   // 9本を [br+16, br+40] に詰める
+      // 粒の角度（約2倍速・本ごとに少し差）＋角度にsinを足して角速度を揺らがす（本ごとに位相/周期をずらし独立に増減）
+      float head = time * (2.2 + fi * 0.22) + fi * 0.7
+        + 0.55 * sin(time * (0.7 + fi * 0.05) + fi * 1.3);
+      float psi = time * 0.12 + fi * 2.094;                // 軌道面の向き（ゆっくり歳差＝立体的に傾く）
+      float cphi = 0.40 + 0.04 * fi;                       // y圧縮率（本ごとに傾きを少し変える）
+      // 本ごとに色相・彩度・明度を少しずつ変える（補色を中心に散らす）
+      vec3 orbCol = hsv2rgb(vec3(
+        fract(baseHue + (fi - 4.0) * 0.022),
+        0.80 + 0.12 * sin(fi * 1.7),
+        0.82 + 0.15 * cos(fi * 1.1)
+      ));
+      float cps = cos(psi), sps = sin(psi);
+      // ピクセルを軌道ローカルへ（-psi回転→y を1/cphiで戻して円空間に）
+      vec2 rr = mat2(cps, -sps, sps, cps) * rel;
+      vec2 e = vec2(rr.x, rr.y / max(cphi, 0.05));
+      float pr = length(e);
+      float pa = atan(e.y, e.x);
+      float dr = pr - orad;
+      float ring = exp(-dr * dr * 0.06);
+      float da = mod(head - pa, 6.2831853);                // 粒の後方への角度差(0..2π)
+      float along = 1.0 - clamp(da / 1.7, 0.0, 1.0);       // 1=粒の位置 → 0=尾の端
+      float arc = ring * along * along;
+      // 先頭の粒（楕円上の位置を +psi 回転して画面へ）
+      vec2 dloc = vec2(cos(head) * orad, sin(head) * orad * cphi);
+      vec2 hp2 = bc + mat2(cps, sps, -sps, cps) * dloc;
+      float hd = length(P - hp2);
+      float dotg = exp(-hd * hd * 0.08);
+      // 奥行き z ∝ sin(角度)。手前は明るく前面へ、奥は暗くして背面へ（ボールに隠れる）。
+      vec3 arcC = orbCol * arc * 0.18;
+      vec3 dotC = orbCol * dotg * 0.70;
+      if (sin(pa) > 0.0)  orbitFront += arcC * (0.6 + 0.4 * sin(pa)); else orbitBack += arcC * 0.5;
+      if (sin(head) > 0.0) orbitFront += dotC * (0.6 + 0.4 * sin(head)); else orbitBack += dotC * 0.5;
+    }
+  }
+
   col += ballGlowColor * glow;
+  col += orbitBack; // 奥の粒（この後のボール本体合成で球と重なる所は隠れる＝立体）
 
   // ---- ボール本体（艶のある3D球として陰影付け）----
   float ballMask = 1.0 - smoothstep(-1.5, 1.5, dBall); // 約3pxのAA
@@ -187,6 +257,8 @@ void main(void) {
   body += iridCol * (fres * clamp(progress, 0.0, 1.0) * 0.5);
 
   col = mix(col, body, ballMask);
+
+  col += orbitFront; // 手前の粒（常にボールの前面に重ねる＝立体の前半分）
 
   // ---- ライン/マーカー（ボールの手前に重ねる＝classic相当）----
   drawGap(col, P, gap, gapColor, lineGlowStr);
@@ -236,6 +308,8 @@ export interface ShaderBackground {
   commitParticles: () => void;
   /** バイオームのパレットを反映（基調色 cool / 終端色 hot, ともに 0xRRGGBB） */
   setBiome: (cool: number, hot: number) => void;
+  /** ボール周回パーティクルの本数（0〜9）を反映 */
+  setOrbitCount: (n: number) => void;
 }
 
 /**
@@ -262,6 +336,7 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
     partCount: { type: '1i', value: 0 },
     parts: { type: '4fv', value: particles.parts },
     partCol: { type: '3fv', value: particles.colors },
+    orbitCount: { type: '1i', value: 0 },
   });
 
   // 注: scrollFactor は既定(1,1)のまま。ニアミスのカメラズーム時に背景+ボールが
@@ -278,6 +353,7 @@ export function addShaderBackground(scene: Phaser.Scene, depth: number): ShaderB
       shader.setUniform('zoneCool.value', rgb(cool));
       shader.setUniform('zoneHot.value', rgb(hot));
     },
+    setOrbitCount: (n: number) => shader.setUniform('orbitCount.value', Math.max(0, Math.min(9, Math.round(n)))),
     setProgress: (t: number) => shader.setUniform('progress.value', t),
     setPlayfield: (s: PlayfieldState) => {
       shader.setUniform('ball.value', { x: s.x, y: s.y, z: s.radius, w: s.rot });
